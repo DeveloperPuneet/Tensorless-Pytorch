@@ -26,6 +26,7 @@ def _add_train_parser(subparsers) -> None:
     p.add_argument("--layers", type=int, default=None)
     p.add_argument("--heads", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=None, dest="batch_size")
+    p.add_argument("--gradient-accumulation-steps", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--learning-rate", type=float, default=None, dest="learning_rate")
     p.add_argument("--device", default=None, choices=["cpu", "cuda", "tpu", "mps"])
@@ -77,6 +78,8 @@ def main(argv=None) -> int:
                 overrides["heads"] = args.heads
             if args.batch_size:
                 overrides["batch_size"] = args.batch_size
+            if args.gradient_accumulation_steps:
+                overrides["gradient_accumulation_steps"] = args.gradient_accumulation_steps
             if args.epochs:
                 overrides["epochs"] = args.epochs
             if args.learning_rate:

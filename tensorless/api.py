@@ -16,6 +16,8 @@ import importlib.resources
 import os
 from typing import Any, Optional
 
+import torch.distributed as dist
+
 from .config import TrainConfig
 from .errors import ConfigError, DataError, ModelError
 from .data.loader import load_dataset
@@ -160,6 +162,10 @@ def train(path: str, **kwargs: Any) -> LoadedModel:
         "training_complete": True,
         "metrics": result["metrics"],
     }
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+        if dist.get_rank() != 0:
+            return LoadedModel(payload)
     save_tl(out, payload)
     if cfg.get("verbose", True):
         print(f"[tensorless] saved trained model to '{out}'")

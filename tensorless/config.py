@@ -43,6 +43,7 @@ class TrainConfig:
     batch_size: Optional[int] = None
     epochs: Optional[int] = None
     max_steps: Optional[int] = None
+    gradient_accumulation_steps: Optional[int] = None
     grad_clip: Optional[float] = None
     warmup_steps: Optional[int] = None
 
@@ -100,6 +101,7 @@ class ResolvedConfig:
     batch_size: int
     epochs: int
     max_steps: Optional[int]
+    gradient_accumulation_steps: int
     grad_clip: float
     warmup_steps: int
 

@@ -7,12 +7,15 @@ logic can be tested and extended independently of the training loop.
 
 from __future__ import annotations
 
+import os
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset as TorchDataset, IterableDataset
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.utils.rnn import pad_sequence
 
 from ..data.loader import Dataset
 from ..data.tabular import TabularPreprocessor
@@ -48,6 +51,9 @@ class _StreamingLMChunkDataset(IterableDataset):
         return self._length
 
     def __iter__(self):
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        chunk_index = 0
         for text in self.texts:
             ids = self.tokenizer.encode(text, add_special_tokens=True)
             if len(ids) <= self.block_size:
@@ -56,6 +62,10 @@ class _StreamingLMChunkDataset(IterableDataset):
                 chunk = ids[start: start + self.block_size + 1]
                 if len(chunk) != self.block_size + 1:
                     continue
+                if chunk_index % world_size != rank:
+                    chunk_index += 1
+                    continue
+                chunk_index += 1
                 yield (
                     torch.tensor(chunk[:-1], dtype=torch.long),
                     torch.tensor(chunk[1:], dtype=torch.long),
@@ -77,6 +87,15 @@ class _ClsTextDataset(TorchDataset):
             torch.tensor(self.attn_masks[idx], dtype=torch.long),
             torch.tensor(self.labels[idx], dtype=torch.long),
         )
+
+
+def _collate_text_classification(batch, pad_id: int):
+    input_ids, attention_masks, labels = zip(*batch)
+    return (
+        pad_sequence(input_ids, batch_first=True, padding_value=pad_id),
+        pad_sequence(attention_masks, batch_first=True, padding_value=0),
+        torch.stack(labels),
+    )
 
 
 class _TabularDataset(TorchDataset):
@@ -102,6 +121,12 @@ def _split_indices(n: int, val_split: float, seed: int) -> Tuple[List[int], List
         train_idx = idx
         val_idx = []
     return train_idx, val_idx
+
+
+def _loader_options(dataset, shuffle: bool):
+    if int(os.environ.get("WORLD_SIZE", 1)) > 1:
+        return {"sampler": DistributedSampler(dataset, shuffle=shuffle), "shuffle": False}
+    return {"shuffle": shuffle}
 
 
 def _build_tokenizer(ds: Dataset, cfg: Dict[str, Any]):
@@ -164,10 +189,6 @@ def prepare_text_classification(
     for text, label in zip(ds.texts, ds.labels):
         ids = tokenizer.encode(text, add_special_tokens=True)[:block_size]
         mask = [1] * len(ids)
-        if len(ids) < block_size:
-            pad_len = block_size - len(ids)
-            ids = ids + [tokenizer.pad_id] * pad_len
-            mask = mask + [0] * pad_len
         input_ids.append(ids)
         attn_masks.append(mask)
         labels.append(label2id.get(label, 0))
@@ -182,9 +203,22 @@ def prepare_text_classification(
             [labels[i] for i in indices],
         )
 
-    train_loader = DataLoader(subset(train_idx), batch_size=cfg["batch_size"], shuffle=True)
+    train_dataset = subset(train_idx)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg["batch_size"],
+        **_loader_options(train_dataset, True),
+        collate_fn=lambda batch: _collate_text_classification(batch, tokenizer.pad_id),
+    )
     val_loader = (
-        DataLoader(subset(val_idx), batch_size=cfg["batch_size"], shuffle=False) if val_idx else None
+        DataLoader(
+            (val_dataset := subset(val_idx)),
+            batch_size=cfg["batch_size"],
+            **_loader_options(val_dataset, False),
+            collate_fn=lambda batch: _collate_text_classification(batch, tokenizer.pad_id),
+        )
+        if val_idx
+        else None
     )
 
     meta = {
@@ -218,7 +252,9 @@ def prepare_tabular(
         transformed["categorical"][train_idx_t],
         transformed["target"][train_idx_t],
     )
-    train_loader = DataLoader(train_ds, batch_size=cfg["batch_size"], shuffle=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=cfg["batch_size"], **_loader_options(train_ds, True)
+    )
 
     val_loader = None
     if val_idx:
@@ -228,7 +264,9 @@ def prepare_tabular(
             transformed["categorical"][val_idx_t],
             transformed["target"][val_idx_t],
         )
-        val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False)
+        val_loader = DataLoader(
+            val_ds, batch_size=cfg["batch_size"], **_loader_options(val_ds, False)
+        )
 
     meta = {
         "n_numeric": len(prep.numeric_columns),

@@ -120,6 +120,7 @@ def resolve_config(ds: Dataset, user: TrainConfig) -> ResolvedConfig:
         batch_size=user.batch_size if user.batch_size is not None else _auto_batch_size(n, max_seq_len),
         epochs=user.epochs or _auto_epochs(n),
         max_steps=user.max_steps,
+        gradient_accumulation_steps=user.gradient_accumulation_steps or 1,
         grad_clip=user.grad_clip if user.grad_clip is not None else 1.0,
         warmup_steps=user.warmup_steps if user.warmup_steps is not None else min(100, max(1, n // 10)),
         val_split=user.val_split if user.val_split is not None else (0.1 if n >= 50 else 0.0),

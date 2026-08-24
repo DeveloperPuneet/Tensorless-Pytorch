@@ -39,6 +39,7 @@ defaults.
 | `batch_size` | auto (scaled to data size, 8-64) | Training batch size |
 | `epochs` | auto (scaled to data size, 5-40) | Max epochs |
 | `max_steps` | `None` | If set, stop after this many optimizer steps regardless of epoch count |
+| `gradient_accumulation_steps` | `1` | Micro-batches to accumulate before each optimizer update |
 | `grad_clip` | `1.0` | Gradient norm clipping threshold |
 | `warmup_steps` | auto | Linear LR warmup steps |
 
@@ -56,6 +57,16 @@ defaults.
 |---|---|---|
 | `device` | auto (`tpu` > `cuda` > `mps` > `cpu`) | Force a specific device |
 | `precision` | auto | `"fp32"`, `"fp16"`, or `"bf16"` |
+
+For multi-GPU training, launch the CLI with `torchrun`, for example:
+
+```bash
+torchrun --standalone --nproc-per-node=2 -m tensorless.cli.main train ./data \
+    --device cuda --batch-size 16
+```
+
+Each process receives a different data shard. Checkpoints and the final `.tl`
+file are written by rank zero only.
 
 ## Checkpointing
 

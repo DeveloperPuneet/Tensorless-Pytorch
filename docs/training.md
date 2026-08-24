@@ -86,6 +86,25 @@ passes, gradient scaling for `fp16`, and checkpointed scaler state for
 consistent resumption. Use `precision="fp32"` for maximum compatibility or
 explicitly select `precision="bf16"` / `precision="fp16"` on CUDA.
 
+## Gradient accumulation
+
+Set `gradient_accumulation_steps` when a full batch does not fit in memory.
+For example, `batch_size=8` and `gradient_accumulation_steps=4` performs one
+optimizer update for every 32 examples while keeping each device batch at 8.
+Learning-rate scheduling, `max_steps`, and checkpoint intervals count actual
+optimizer updates.
+
+## Distributed and multi-GPU training
+
+Use PyTorch's launcher with one process per GPU. Tensorless PyTorch initializes
+DDP, assigns each process its local CUDA device, shards map-style and streaming
+datasets, synchronizes validation loss, and lets rank zero write artifacts:
+
+```bash
+torchrun --standalone --nproc-per-node=2 -m tensorless.cli.main train ./data \
+    --device cuda
+```
+
 ## Checkpointing during training
 
 A checkpoint is written every `checkpoint_every` steps (default: 50)

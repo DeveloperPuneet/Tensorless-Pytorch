@@ -78,3 +78,20 @@ def test_resume_false_starts_from_scratch(text_corpus, workdir):
         heads=2, max_seq_len=32, batch_size=16, epochs=1, verbose=False,
     )
     assert model.config["d_model"] == 24
+
+
+def test_gradient_accumulation_counts_optimizer_steps(text_corpus, workdir):
+    model = tl.train(
+        text_corpus,
+        out="accumulated.tl",
+        max_steps=3,
+        gradient_accumulation_steps=2,
+        batch_size=4,
+        epochs=2,
+        d_model=16,
+        layers=1,
+        heads=2,
+        max_seq_len=32,
+        verbose=False,
+    )
+    assert model.metrics["global_step"] == 3

@@ -9,12 +9,16 @@ needed to write the final `.tl` file.
 from __future__ import annotations
 
 import time
+import math
+import os
 from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 
 from ..data.loader import Dataset
 from ..devices.device import get_torch_device
@@ -105,7 +109,19 @@ def run_training(
     model_type = cfg["model_type"]
     torch.manual_seed(cfg["seed"])
 
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed = world_size > 1
+    rank = int(os.environ.get("RANK", "0"))
+    if distributed and not dist.is_initialized():
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
+
     device = get_torch_device(cfg["device"])
+    if distributed and device.type == "cuda":
+        device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+        torch.cuda.set_device(device)
+    cfg = dict(cfg)
+    cfg["verbose"] = cfg["verbose"] and rank == 0
     amp_enabled = device.type == "cuda" and cfg["precision"] in ("fp16", "bf16")
     scaler = _build_grad_scaler(amp_enabled and cfg["precision"] == "fp16")
     if cfg["verbose"]:
@@ -133,9 +149,17 @@ def run_training(
 
     # ---- model / optimizer / scheduler ----
     model = build_model(task, model_type, cfg, prepared.meta).to(device)
+    if distributed:
+        model = DistributedDataParallel(
+            model,
+            device_ids=[device.index] if device.type == "cuda" else None,
+        )
     optimizer = _build_optimizer(model, cfg)
 
-    steps_per_epoch = max(1, len(prepared.train_loader))
+    accumulation_steps = cfg.get("gradient_accumulation_steps", 1)
+    if accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    steps_per_epoch = max(1, math.ceil(len(prepared.train_loader) / accumulation_steps))
     total_steps = cfg.get("max_steps") or steps_per_epoch * cfg["epochs"]
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda s: _lr_lambda(s, cfg["warmup_steps"], total_steps)
@@ -161,10 +185,12 @@ def run_training(
     pad_id = prepared.meta.get("pad_id", 0)
 
     def _checkpoint(epoch: int, training_complete: bool) -> None:
+        if distributed and rank != 0:
+            return
         state = {
             "epoch": epoch,
             "global_step": global_step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": (model.module if distributed else model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
@@ -181,39 +207,48 @@ def run_training(
 
     # ---- training loop ----
     model.train()
+    optimizer.zero_grad()
     stop = False
     t0 = time.time()
     last_val_loss = None
     last_train_loss = None
 
     for epoch in range(start_epoch, cfg["epochs"]):
-        for batch in prepared.train_loader:
+        for loader in (prepared.train_loader, prepared.val_loader):
+            if loader is not None and hasattr(loader.sampler, "set_epoch"):
+                loader.sampler.set_epoch(epoch)
+        for batch_index, batch in enumerate(prepared.train_loader):
             with _amp_context(device, cfg["precision"]):
                 loss = _compute_loss(task, model_type, model, batch, device, pad_id)
             last_train_loss = loss.item()
-            optimizer.zero_grad()
+            group_start = batch_index - (batch_index % accumulation_steps)
+            group_size = min(accumulation_steps, len(prepared.train_loader) - group_start)
+            loss = loss / group_size
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
-                if cfg["grad_clip"]:
-                    scaler.unscale_(optimizer)
             else:
                 loss.backward()
-            if cfg["grad_clip"]:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                optimizer.step()
-            scheduler.step()
-            global_step += 1
+            is_last_batch = batch_index + 1 == len(prepared.train_loader)
+            if (batch_index + 1) % accumulation_steps == 0 or is_last_batch:
+                if scaler.is_enabled():
+                    if cfg["grad_clip"]:
+                        scaler.unscale_(optimizer)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    if cfg["grad_clip"]:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+                    optimizer.step()
+                optimizer.zero_grad()
+                scheduler.step()
+                global_step += 1
 
-            if global_step % cfg["checkpoint_every"] == 0:
-                _checkpoint(epoch, training_complete=False)
+                if global_step % cfg["checkpoint_every"] == 0:
+                    _checkpoint(epoch, training_complete=False)
 
-            if cfg.get("max_steps") and global_step >= cfg["max_steps"]:
-                stop = True
-                break
+                if cfg.get("max_steps") and global_step >= cfg["max_steps"]:
+                    stop = True
+                    break
         if stop:
             break
 
@@ -226,6 +261,10 @@ def run_training(
                     with _amp_context(device, cfg["precision"]):
                         losses.append(_compute_loss(task, model_type, model, batch, device, pad_id).item())
             val_loss = sum(losses) / max(1, len(losses))
+            if distributed:
+                val_tensor = torch.tensor([val_loss], device=device)
+                dist.all_reduce(val_tensor, op=dist.ReduceOp.SUM)
+                val_loss = (val_tensor / world_size).item()
             last_val_loss = val_loss
             model.train()
             is_best = early_stopper.step(val_loss, state=None)
@@ -259,7 +298,7 @@ def run_training(
 
     return {
         "model": model,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": (model.module if distributed else model).state_dict(),
         "meta": prepared.meta,
         "tokenizer": prepared.tokenizer,
         "preprocessor": prepared.preprocessor,
