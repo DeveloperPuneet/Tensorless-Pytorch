@@ -7,7 +7,7 @@ experience is assumed.
 ## Setup
 
 ```bash
-pip install -e .
+pip install tensorless-pytorch
 mkdir tensorless_tutorial && cd tensorless_tutorial
 ```
 

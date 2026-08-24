@@ -85,6 +85,14 @@ def _amp_context(device: torch.device, precision: str):
     return torch.autocast(device_type="cuda", dtype=dtype)
 
 
+def _build_grad_scaler(enabled: bool):
+    """Build the available PyTorch scaler API across supported versions."""
+    try:
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def run_training(
     ds: Dataset,
     cfg: Dict[str, Any],
@@ -99,7 +107,7 @@ def run_training(
 
     device = get_torch_device(cfg["device"])
     amp_enabled = device.type == "cuda" and cfg["precision"] in ("fp16", "bf16")
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled and cfg["precision"] == "fp16")
+    scaler = _build_grad_scaler(amp_enabled and cfg["precision"] == "fp16")
     if cfg["verbose"]:
         actual_precision = cfg["precision"] if amp_enabled else "fp32"
         log_fn(f"[tensorless] task={task} model={model_type} device={device} precision={actual_precision}")
