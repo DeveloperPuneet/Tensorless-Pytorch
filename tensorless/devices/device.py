@@ -39,8 +39,19 @@ def _mps_available() -> bool:
 
 
 def _cuda_supports_bf16() -> bool:
+    """`torch.cuda.is_bf16_supported()` returns True as soon as bf16 ops
+    can be *executed* at all, which is true even on GPUs (like the T4)
+    that have no native bf16 tensor-core support and just emulate it --
+    training still runs, but slower, and torch.compile's inductor backend
+    will skip bf16 codegen and print a warning for every kernel. Real
+    accelerated bf16 needs Ampere or newer (compute capability >= 8.0),
+    so check that directly instead.
+    """
     try:
-        return torch.cuda.is_bf16_supported()
+        if not torch.cuda.is_available():
+            return False
+        major, _ = torch.cuda.get_device_capability(0)
+        return major >= 8
     except Exception:
         return False
 

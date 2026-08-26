@@ -205,6 +205,15 @@ def run_training(
         if cfg["verbose"]:
             log_fn(f"[tensorless] using {len(gpu_ids)} GPUs via DataParallel (gpu_ids={gpu_ids})")
     uses_module_wrapper = distributed or multi_gpu_dp
+    # Keep a stable reference to the model *before* torch.compile wraps it.
+    # torch.compile's OptimizedModule.state_dict() prefixes every key with
+    # "_orig_mod." (an implementation detail of how it traces the module),
+    # so saving/loading straight from the compiled object silently produces
+    # a checkpoint whose keys don't match the real model architecture at
+    # all -- always save/load/resume through this pre-compile reference
+    # instead, since its parameters are the same tensors the compiled
+    # function actually trains (compile wraps, it doesn't copy).
+    ckpt_model = model
     if multi_gpu_dp and cfg.get("compile"):
         if cfg["verbose"]:
             log_fn("[tensorless] skipping torch.compile with DataParallel (not well supported together)")
@@ -226,7 +235,7 @@ def run_training(
     global_step = 0
 
     if resume_state is not None:
-        (model.module if uses_module_wrapper else model).load_state_dict(resume_state["model_state_dict"])
+        (ckpt_model.module if uses_module_wrapper else ckpt_model).load_state_dict(resume_state["model_state_dict"])
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
         scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         if resume_state.get("scaler_state_dict"):
@@ -246,7 +255,7 @@ def run_training(
         state = {
             "epoch": epoch,
             "global_step": global_step,
-            "model_state_dict": (model.module if uses_module_wrapper else model).state_dict(),
+            "model_state_dict": (ckpt_model.module if uses_module_wrapper else ckpt_model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
@@ -356,7 +365,7 @@ def run_training(
 
     return {
         "model": model,
-        "model_state_dict": (model.module if uses_module_wrapper else model).state_dict(),
+        "model_state_dict": (ckpt_model.module if uses_module_wrapper else ckpt_model).state_dict(),
         "meta": prepared.meta,
         "tokenizer": prepared.tokenizer,
         "preprocessor": prepared.preprocessor,
