@@ -27,6 +27,7 @@ class TrainConfig:
     # --- task / architecture ---
     task: Optional[str] = None                  # "text-generation", "classification", "regression"
     model_type: Optional[str] = None            # "transformer", "mlp"
+    architecture: Optional[str] = None          # "v1" (legacy) or "v2" (RoPE/RMSNorm/SwiGLU); default "v2"
     d_model: Optional[int] = None
     layers: Optional[int] = None
     heads: Optional[int] = None
@@ -35,6 +36,9 @@ class TrainConfig:
     max_seq_len: Optional[int] = None
     tokenizer: Optional[str] = None           # "char" or "bpe"
     bpe_vocab_size: Optional[int] = None
+    gradient_checkpointing: Optional[bool] = None  # trade compute for memory on big models
+    compile: Optional[bool] = None                  # torch.compile() on CUDA when available
+    num_workers: Optional[int] = None               # DataLoader worker processes
 
     # --- optimization ---
     optimizer: Optional[str] = None             # "adamw", "adam", "sgd"
@@ -86,6 +90,7 @@ class ResolvedConfig:
 
     task: str
     model_type: str
+    architecture: str
     d_model: int
     layers: int
     heads: int
@@ -94,6 +99,9 @@ class ResolvedConfig:
     max_seq_len: int
     tokenizer: str
     bpe_vocab_size: int
+    gradient_checkpointing: bool
+    compile: bool
+    num_workers: int
 
     optimizer: str
     learning_rate: float

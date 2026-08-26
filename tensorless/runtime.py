@@ -52,20 +52,34 @@ class LoadedModel:
     # ------------------------------------------------------------------
     # Text generation
     # ------------------------------------------------------------------
-    def generate(self, prompt: str = "", max_new_tokens: int = 200, temperature: float = 0.8, top_k: int = 40) -> str:
+    def generate(
+        self,
+        prompt: str = "",
+        max_new_tokens: int = 200,
+        temperature: float = 0.8,
+        top_k: int = 40,
+        top_p: float = None,
+        repetition_penalty: float = 1.0,
+    ) -> str:
         if self.task != "text-generation":
             raise ModelError(f"generate() is only available for text-generation models, not '{self.task}'.")
         ids = self.tokenizer.encode(prompt, add_special_tokens=True)[:-1]  # drop trailing eos
         if not ids:
             ids = [self.tokenizer.bos_id]
         input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
-        out = self.model.generate(
-            input_ids,
+        gen_kwargs = dict(
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             top_k=top_k,
             eos_id=self.tokenizer.eos_id,
         )
+        # top_p / repetition_penalty and KV-cached decoding are only
+        # supported by the v2 architecture; v1 checkpoints silently fall
+        # back to the arguments they understand.
+        if self.config.get("architecture", "v1") == "v2":
+            gen_kwargs["top_p"] = top_p
+            gen_kwargs["repetition_penalty"] = repetition_penalty
+        out = self.model.generate(input_ids, **gen_kwargs)
         return self.tokenizer.decode(out[0].tolist())
 
     def chat(self) -> None:

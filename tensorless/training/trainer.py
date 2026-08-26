@@ -21,7 +21,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
 from ..data.loader import Dataset
-from ..devices.device import get_torch_device
+from ..devices.device import get_torch_device, get_device_info, mark_step
 from ..checkpoint.manager import CheckpointManager
 from ..models.registry import build_model
 from ..tokenization import tokenizer_from_state_dict
@@ -54,9 +54,10 @@ def _lr_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
 
 
 def _compute_loss(task: str, model_type: str, model: nn.Module, batch, device, pad_id: int) -> torch.Tensor:
+    non_blocking = device.type == "cuda"
     if model_type == "transformer" and task == "text-generation":
         x, y = batch
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=non_blocking), y.to(device, non_blocking=non_blocking)
         logits = model(x)
         loss = F.cross_entropy(
             logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=pad_id
@@ -64,17 +65,23 @@ def _compute_loss(task: str, model_type: str, model: nn.Module, batch, device, p
         return loss
     elif model_type == "transformer" and task == "text-classification":
         input_ids, attn_mask, labels = batch
-        input_ids, attn_mask, labels = input_ids.to(device), attn_mask.to(device), labels.to(device)
+        input_ids = input_ids.to(device, non_blocking=non_blocking)
+        attn_mask = attn_mask.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
         logits = model(input_ids, attention_mask=attn_mask)
         return F.cross_entropy(logits, labels)
     elif model_type == "mlp" and task == "classification":
         numeric, categorical, target = batch
-        numeric, categorical, target = numeric.to(device), categorical.to(device), target.to(device)
+        numeric = numeric.to(device, non_blocking=non_blocking)
+        categorical = categorical.to(device, non_blocking=non_blocking)
+        target = target.to(device, non_blocking=non_blocking)
         logits = model(numeric, categorical)
         return F.cross_entropy(logits, target)
     elif model_type == "mlp" and task == "regression":
         numeric, categorical, target = batch
-        numeric, categorical, target = numeric.to(device), categorical.to(device), target.to(device)
+        numeric = numeric.to(device, non_blocking=non_blocking)
+        categorical = categorical.to(device, non_blocking=non_blocking)
+        target = target.to(device, non_blocking=non_blocking)
         pred = model(numeric, categorical)
         return F.mse_loss(pred, target)
     else:
@@ -82,11 +89,37 @@ def _compute_loss(task: str, model_type: str, model: nn.Module, batch, device, p
 
 
 def _amp_context(device: torch.device, precision: str):
-    """Return a CUDA autocast context when the resolved precision supports it."""
+    """Return an autocast context when the resolved precision supports it.
+    TPU (XLA) doesn't use CUDA-style autocast -- bf16 there is handled by
+    casting the model itself (see `_maybe_cast_for_tpu`), so this only
+    ever activates for CUDA.
+    """
     if device.type != "cuda" or precision not in ("fp16", "bf16"):
         return nullcontext()
     dtype = torch.float16 if precision == "fp16" else torch.bfloat16
     return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def _maybe_cast_for_tpu(model: nn.Module, device: torch.device, precision: str) -> nn.Module:
+    """TPUs get their mixed-precision speedup from running the whole model
+    in bfloat16 (XLA handles the numerics well since bf16 has the same
+    exponent range as fp32), rather than an autocast context manager.
+    """
+    if device.type == "xla" and precision == "bf16":
+        return model.to(torch.bfloat16)
+    return model
+
+
+def _maybe_compile(model: nn.Module, device: torch.device, cfg: Dict[str, Any], log_fn) -> nn.Module:
+    if device.type != "cuda" or not cfg.get("compile"):
+        return model
+    try:
+        compiled = torch.compile(model)
+        return compiled
+    except Exception as e:
+        if cfg.get("verbose"):
+            log_fn(f"[tensorless] torch.compile unavailable ({e}); continuing uncompiled")
+        return model
 
 
 def _build_grad_scaler(enabled: bool):
@@ -125,8 +158,14 @@ def run_training(
     amp_enabled = device.type == "cuda" and cfg["precision"] in ("fp16", "bf16")
     scaler = _build_grad_scaler(amp_enabled and cfg["precision"] == "fp16")
     if cfg["verbose"]:
-        actual_precision = cfg["precision"] if amp_enabled else "fp32"
-        log_fn(f"[tensorless] task={task} model={model_type} device={device} precision={actual_precision}")
+        actual_precision = cfg["precision"] if (amp_enabled or device.type == "xla") else "fp32"
+        info = get_device_info(device)
+        mem = f", {info['memory_gb']}GB" if info.get("memory_gb") else ""
+        ndev = f" x{info['num_devices']}" if info.get("num_devices", 1) > 1 else ""
+        log_fn(
+            f"[tensorless] task={task} model={model_type} architecture={cfg.get('architecture', 'v1')} "
+            f"device={device} ({info['name']}{ndev}{mem}) precision={actual_precision}"
+        )
 
     # ---- data prep (resume tokenizer/preprocessor if available) ----
     tokenizer = None
@@ -149,11 +188,13 @@ def run_training(
 
     # ---- model / optimizer / scheduler ----
     model = build_model(task, model_type, cfg, prepared.meta).to(device)
+    model = _maybe_cast_for_tpu(model, device, cfg["precision"])
     if distributed:
         model = DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
         )
+    model = _maybe_compile(model, device, cfg, log_fn)
     optimizer = _build_optimizer(model, cfg)
 
     accumulation_steps = cfg.get("gradient_accumulation_steps", 1)
@@ -241,6 +282,7 @@ def run_training(
                     optimizer.step()
                 optimizer.zero_grad()
                 scheduler.step()
+                mark_step(device)
                 global_step += 1
 
                 if global_step % cfg["checkpoint_every"] == 0:
@@ -260,6 +302,7 @@ def run_training(
                 for batch in prepared.val_loader:
                     with _amp_context(device, cfg["precision"]):
                         losses.append(_compute_loss(task, model_type, model, batch, device, pad_id).item())
+                    mark_step(device)
             val_loss = sum(losses) / max(1, len(losses))
             if distributed:
                 val_tensor = torch.tensor([val_loss], device=device)

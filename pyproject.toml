@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tensorless-pytorch"
-version = "0.2.0"
+version = "0.3.0"
 description = "Automatic PyTorch training with portable models and minimal setup."
 readme = "README.md"
 requires-python = ">=3.9"

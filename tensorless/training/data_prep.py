@@ -35,17 +35,23 @@ class PreparedData:
 
 
 class _StreamingLMChunkDataset(IterableDataset):
-    """Tokenize text lazily and yield fixed-size language-model batches."""
+    """Tokenize text once up front, then yield fixed-size language-model
+    chunks lazily. Tokenizing eagerly (rather than inside `__iter__`)
+    matters once vocab/corpus sizes get big: re-running BPE encoding on
+    every text on every epoch is the single biggest avoidable cost in the
+    training loop at "upper-mid" scale.
+    """
 
     def __init__(self, texts: List[str], tokenizer, block_size: int):
-        self.texts = texts
         self.tokenizer = tokenizer
         self.block_size = block_size
-        self._length = sum(self._count_chunks(text) for text in texts)
-
-    def _count_chunks(self, text: str) -> int:
-        token_count = len(self.tokenizer.encode(text, add_special_tokens=True))
-        return max(1, token_count - self.block_size)
+        self._token_seqs: List[List[int]] = []
+        for text in texts:
+            ids = tokenizer.encode(text, add_special_tokens=True)
+            if len(ids) <= block_size:
+                ids = ids + [tokenizer.pad_id] * (block_size + 1 - len(ids))
+            self._token_seqs.append(ids)
+        self._length = sum(max(1, len(ids) - block_size) for ids in self._token_seqs)
 
     def __len__(self) -> int:
         return self._length
@@ -53,16 +59,20 @@ class _StreamingLMChunkDataset(IterableDataset):
     def __iter__(self):
         rank = int(os.environ.get("RANK", 0))
         world_size = int(os.environ.get("WORLD_SIZE", 1))
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        # Combine DDP rank sharding with DataLoader worker sharding so
+        # that using num_workers > 0 never duplicates data across workers.
+        shard_id = rank * num_workers + worker_id
+        shard_count = world_size * num_workers
         chunk_index = 0
-        for text in self.texts:
-            ids = self.tokenizer.encode(text, add_special_tokens=True)
-            if len(ids) <= self.block_size:
-                ids = ids + [self.tokenizer.pad_id] * (self.block_size + 1 - len(ids))
+        for ids in self._token_seqs:
             for start in range(0, len(ids) - self.block_size):
                 chunk = ids[start: start + self.block_size + 1]
                 if len(chunk) != self.block_size + 1:
                     continue
-                if chunk_index % world_size != rank:
+                if chunk_index % shard_count != shard_id:
                     chunk_index += 1
                     continue
                 chunk_index += 1
@@ -129,6 +139,22 @@ def _loader_options(dataset, shuffle: bool):
     return {"shuffle": shuffle}
 
 
+def _loader_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Shared DataLoader performance knobs: worker processes + pinned
+    memory for fast host->GPU transfer. A no-op on CPU/TPU where
+    `num_workers` auto-resolves to 0 (see `auto/config.py`).
+    """
+    num_workers = cfg.get("num_workers", 0)
+    kwargs: Dict[str, Any] = {
+        "num_workers": num_workers,
+        "pin_memory": cfg.get("device") == "cuda",
+    }
+    if num_workers > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
+    return kwargs
+
+
 def _build_tokenizer(ds: Dataset, cfg: Dict[str, Any]):
     if cfg.get("tokenizer", "bpe") == "bpe":
         return BPETokenizer.build(ds.texts, vocab_size=cfg.get("bpe_vocab_size", 1000))
@@ -157,14 +183,14 @@ def prepare_text_generation(
 
     train_ds = _StreamingLMChunkDataset(train_texts, tokenizer, block_size)
     train_loader = DataLoader(
-        train_ds, batch_size=cfg["batch_size"], shuffle=False, drop_last=False
+        train_ds, batch_size=cfg["batch_size"], shuffle=False, drop_last=False, **_loader_kwargs(cfg)
     )
 
     val_loader = None
     if val_texts is not None:
         val_ds = _StreamingLMChunkDataset(val_texts, tokenizer, block_size)
         if len(val_ds) > 0:
-            val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False)
+            val_loader = DataLoader(val_ds, batch_size=cfg["batch_size"], shuffle=False, **_loader_kwargs(cfg))
 
     meta = {
         "vocab_size": tokenizer.vocab_size,
@@ -208,6 +234,7 @@ def prepare_text_classification(
         train_dataset,
         batch_size=cfg["batch_size"],
         **_loader_options(train_dataset, True),
+        **_loader_kwargs(cfg),
         collate_fn=lambda batch: _collate_text_classification(batch, tokenizer.pad_id),
     )
     val_loader = (
@@ -215,6 +242,7 @@ def prepare_text_classification(
             (val_dataset := subset(val_idx)),
             batch_size=cfg["batch_size"],
             **_loader_options(val_dataset, False),
+            **_loader_kwargs(cfg),
             collate_fn=lambda batch: _collate_text_classification(batch, tokenizer.pad_id),
         )
         if val_idx
@@ -253,7 +281,8 @@ def prepare_tabular(
         transformed["target"][train_idx_t],
     )
     train_loader = DataLoader(
-        train_ds, batch_size=cfg["batch_size"], **_loader_options(train_ds, True)
+        train_ds, batch_size=cfg["batch_size"], **_loader_options(train_ds, True),
+        pin_memory=cfg.get("device") == "cuda",
     )
 
     val_loader = None
@@ -265,7 +294,8 @@ def prepare_tabular(
             transformed["target"][val_idx_t],
         )
         val_loader = DataLoader(
-            val_ds, batch_size=cfg["batch_size"], **_loader_options(val_ds, False)
+            val_ds, batch_size=cfg["batch_size"], **_loader_options(val_ds, False),
+            pin_memory=cfg.get("device") == "cuda",
         )
 
     meta = {

@@ -27,10 +27,18 @@ tokenizer; use `tokenizer="char"` for a character-level model. Tensorless PyTorc
 derives model size, batch size, epochs, validation, device, and BPE vocabulary
 size from the data, while every setting can be overridden.
 
-Long text is tokenized lazily and fed through PyTorch in fixed-size batches.
-CUDA training automatically uses `fp16` or `bf16` when supported, including
-gradient scaling and checkpointed scaler state. Reduce `batch_size` if memory
-is limited.
+Text is tokenized once up front (not re-tokenized every epoch) and streamed
+through PyTorch in fixed-size batches. Model size is auto-scaled with corpus
+size across four tiers -- small, lower-mid, upper-mid, large -- capped at
+"upper-mid" (roughly 50M-350M parameters) unless you pass explicit
+`d_model=`/`layers=`/etc. yourself. New training runs use the `architecture="v2"`
+backbone (RoPE + RMSNorm + SwiGLU + KV-cached generation); older `.tl`
+checkpoints keep loading and running on the original `"v1"` backbone
+automatically. CUDA training automatically uses `fp16` or `bf16` when
+supported (with gradient scaling and checkpointed scaler state), TPU (XLA)
+training is supported via `device="tpu"`, and large auto-sized models enable
+gradient checkpointing automatically to fit in memory. Reduce `batch_size` if
+memory is limited.
 
 ## English starter pretraining
 
