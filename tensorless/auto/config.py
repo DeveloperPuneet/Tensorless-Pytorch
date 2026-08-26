@@ -24,7 +24,7 @@ from typing import Any, Dict, Tuple
 
 from ..config import TrainConfig, ResolvedConfig
 from ..data.loader import Dataset
-from ..devices.device import auto_select_device, get_torch_device, recommend_max_params
+from ..devices.device import auto_select_device, get_torch_device, get_device_info, recommend_max_params
 from .detector import detect_task
 
 
@@ -86,20 +86,25 @@ def _fit_within_param_budget(
     return d_model, layers, heads, ff_mult
 
 
-def _auto_batch_size(n_examples: int, max_seq_len: int, device: str) -> int:
+def _auto_batch_size(n_examples: int, max_seq_len: int, device: str, num_devices: int = 1) -> int:
     # GPUs/TPUs benefit from a larger token budget per step than CPU.
     token_budget = 32768 if device in ("cuda", "tpu") else 8192
     sequence_batch = max(1, token_budget // max_seq_len)
     if n_examples < 200:
-        return min(8, sequence_batch)
+        base = min(8, sequence_batch)
     elif n_examples < 2000:
-        return min(16, sequence_batch)
+        base = min(16, sequence_batch)
     elif n_examples < 20000:
-        return min(32, sequence_batch)
+        base = min(32, sequence_batch)
     elif n_examples < 200000:
-        return min(64, sequence_batch)
+        base = min(64, sequence_batch)
     else:
-        return min(128, sequence_batch)
+        base = min(128, sequence_batch)
+    # When training will be split across multiple GPUs (DataParallel or
+    # DDP), scale the global batch up so each GPU still gets a
+    # reasonably-sized per-device batch instead of shrinking as GPUs are
+    # added.
+    return base * max(1, num_devices)
 
 
 def _auto_epochs(n_examples: int) -> int:
@@ -161,6 +166,12 @@ def resolve_config(ds: Dataset, user: TrainConfig) -> ResolvedConfig:
 
     device, precision = auto_select_device(user.device, user.precision)
     torch_device = get_torch_device(device)
+    device_info = get_device_info(torch_device)
+    num_gpus = device_info.get("num_devices", 1) if device == "cuda" else 1
+
+    multi_gpu = user.multi_gpu
+    if multi_gpu is None:
+        multi_gpu = device == "cuda" and num_gpus > 1
 
     if model_type == "transformer":
         d_model, layers, heads, ff_mult = _text_model_tier(n)
@@ -220,7 +231,9 @@ def resolve_config(ds: Dataset, user: TrainConfig) -> ResolvedConfig:
         optimizer=user.optimizer or "adamw",
         learning_rate=user.learning_rate or (3e-4 if model_type == "transformer" else 1e-3),
         weight_decay=user.weight_decay if user.weight_decay is not None else 0.01,
-        batch_size=user.batch_size if user.batch_size is not None else _auto_batch_size(n, max_seq_len, device),
+        batch_size=user.batch_size if user.batch_size is not None else _auto_batch_size(
+            n, max_seq_len, device, num_gpus if multi_gpu else 1
+        ),
         epochs=user.epochs or _auto_epochs(n),
         max_steps=user.max_steps,
         gradient_accumulation_steps=user.gradient_accumulation_steps or 1,
@@ -236,6 +249,7 @@ def resolve_config(ds: Dataset, user: TrainConfig) -> ResolvedConfig:
         gradient_checkpointing=gradient_checkpointing,
         compile=compile_model,
         num_workers=num_workers,
+        multi_gpu=multi_gpu,
         seed=user.seed,
         verbose=user.verbose,
     )

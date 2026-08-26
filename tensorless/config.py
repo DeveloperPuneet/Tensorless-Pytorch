@@ -39,6 +39,9 @@ class TrainConfig:
     gradient_checkpointing: Optional[bool] = None  # trade compute for memory on big models
     compile: Optional[bool] = None                  # torch.compile() on CUDA when available
     num_workers: Optional[int] = None               # DataLoader worker processes
+    multi_gpu: Optional[bool] = None                # auto-wrap with DataParallel when >1 GPU visible
+                                                      # in a single process (e.g. a notebook), so a
+                                                      # second GPU doesn't just sit idle
 
     # --- optimization ---
     optimizer: Optional[str] = None             # "adamw", "adam", "sgd"
@@ -102,6 +105,7 @@ class ResolvedConfig:
     gradient_checkpointing: bool
     compile: bool
     num_workers: int
+    multi_gpu: bool
 
     optimizer: str
     learning_rate: float

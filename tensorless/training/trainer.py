@@ -189,12 +189,27 @@ def run_training(
     # ---- model / optimizer / scheduler ----
     model = build_model(task, model_type, cfg, prepared.meta).to(device)
     model = _maybe_cast_for_tpu(model, device, cfg["precision"])
+    multi_gpu_dp = False
     if distributed:
         model = DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
         )
-    model = _maybe_compile(model, device, cfg, log_fn)
+    elif device.type == "cuda" and cfg.get("multi_gpu") and torch.cuda.device_count() > 1:
+        # Single-process multi-GPU (e.g. a Kaggle/Colab notebook with 2+
+        # GPUs): without this, only cuda:0 is ever touched and any other
+        # visible GPU sits idle at 0% utilization the whole run.
+        gpu_ids = list(range(torch.cuda.device_count()))
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+        multi_gpu_dp = True
+        if cfg["verbose"]:
+            log_fn(f"[tensorless] using {len(gpu_ids)} GPUs via DataParallel (gpu_ids={gpu_ids})")
+    uses_module_wrapper = distributed or multi_gpu_dp
+    if multi_gpu_dp and cfg.get("compile"):
+        if cfg["verbose"]:
+            log_fn("[tensorless] skipping torch.compile with DataParallel (not well supported together)")
+    else:
+        model = _maybe_compile(model, device, cfg, log_fn)
     optimizer = _build_optimizer(model, cfg)
 
     accumulation_steps = cfg.get("gradient_accumulation_steps", 1)
@@ -211,7 +226,7 @@ def run_training(
     global_step = 0
 
     if resume_state is not None:
-        model.load_state_dict(resume_state["model_state_dict"])
+        (model.module if uses_module_wrapper else model).load_state_dict(resume_state["model_state_dict"])
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
         scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         if resume_state.get("scaler_state_dict"):
@@ -231,7 +246,7 @@ def run_training(
         state = {
             "epoch": epoch,
             "global_step": global_step,
-            "model_state_dict": (model.module if distributed else model).state_dict(),
+            "model_state_dict": (model.module if uses_module_wrapper else model).state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
@@ -341,7 +356,7 @@ def run_training(
 
     return {
         "model": model,
-        "model_state_dict": (model.module if distributed else model).state_dict(),
+        "model_state_dict": (model.module if uses_module_wrapper else model).state_dict(),
         "meta": prepared.meta,
         "tokenizer": prepared.tokenizer,
         "preprocessor": prepared.preprocessor,
