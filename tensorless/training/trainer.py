@@ -130,12 +130,36 @@ def _build_grad_scaler(enabled: bool):
         return torch.cuda.amp.GradScaler(enabled=enabled)
 
 
+def _load_pretrained_weights(model: nn.Module, pretrained_sd: Dict[str, Any], log_fn, verbose: bool) -> None:
+    """Initialize `model` from a pretrained state dict, skipping any keys
+    whose shape doesn't match (typically the task head -- e.g. going from
+    text-generation to text-classification, or a different n_classes).
+    Everything else (embeddings, attention/MLP blocks, norms) transfers.
+    """
+    model_sd = model.state_dict()
+    compatible: Dict[str, Any] = {}
+    skipped = []
+    for key, value in pretrained_sd.items():
+        if key in model_sd and model_sd[key].shape == value.shape:
+            compatible[key] = value
+        else:
+            skipped.append(key)
+    model.load_state_dict(compatible, strict=False)
+    if verbose:
+        log_fn(
+            f"[tensorless] loaded {len(compatible)}/{len(pretrained_sd)} pretrained weight "
+            f"tensors" + (f"; reinitialized {len(skipped)} mismatched (e.g. task head): {skipped[:4]}"
+                           f"{'...' if len(skipped) > 4 else ''}" if skipped else "")
+        )
+
+
 def run_training(
     ds: Dataset,
     cfg: Dict[str, Any],
     checkpoint_mgr: CheckpointManager,
     dataset_fingerprint: str,
     resume_state: Optional[Dict[str, Any]] = None,
+    init_from: Optional[Dict[str, Any]] = None,
     log_fn=print,
 ) -> Dict[str, Any]:
     task = cfg["task"]
@@ -175,6 +199,15 @@ def run_training(
             tokenizer = tokenizer_from_state_dict(resume_state["tokenizer_state"])
         if resume_state.get("preprocessor_state") is not None:
             preprocessor = TabularPreprocessor.from_state_dict(resume_state["preprocessor_state"])
+    elif init_from is not None:
+        # Fine-tuning: reuse the pretrained model's exact tokenizer/
+        # preprocessor rather than fitting a new one on this dataset --
+        # token ids (and numeric scaling/categorical vocabs) must line up
+        # with what the pretrained weights were trained on.
+        if init_from.get("tokenizer_state") is not None:
+            tokenizer = tokenizer_from_state_dict(init_from["tokenizer_state"])
+        if init_from.get("preprocessor_state") is not None:
+            preprocessor = TabularPreprocessor.from_state_dict(init_from["preprocessor_state"])
 
     if task == "text-generation":
         prepared = dp.prepare_text_generation(ds, cfg, tokenizer=tokenizer)
@@ -189,6 +222,8 @@ def run_training(
     # ---- model / optimizer / scheduler ----
     model = build_model(task, model_type, cfg, prepared.meta).to(device)
     model = _maybe_cast_for_tpu(model, device, cfg["precision"])
+    if init_from is not None and resume_state is None:
+        _load_pretrained_weights(model, init_from["model_state_dict"], log_fn, cfg["verbose"])
     multi_gpu_dp = False
     if distributed:
         model = DistributedDataParallel(

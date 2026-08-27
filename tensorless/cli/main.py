@@ -30,6 +30,7 @@ def _add_train_parser(subparsers) -> None:
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--learning-rate", type=float, default=None, dest="learning_rate")
     p.add_argument("--device", default=None, choices=["cpu", "cuda", "tpu", "mps"])
+    p.add_argument("--pretrained", default=None, help="Path to a .tl checkpoint to fine-tune from")
     p.add_argument("--quiet", action="store_true", help="Suppress training logs")
 
 
@@ -86,6 +87,8 @@ def main(argv=None) -> int:
                 overrides["learning_rate"] = args.learning_rate
             if args.device:
                 overrides["device"] = args.device
+            if args.pretrained:
+                overrides["pretrained"] = args.pretrained
             if args.quiet:
                 overrides["verbose"] = False
             api.train(args.path, **overrides)

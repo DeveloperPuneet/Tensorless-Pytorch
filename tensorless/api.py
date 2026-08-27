@@ -130,6 +130,53 @@ def train(path: str, **kwargs: Any) -> LoadedModel:
         checkpoint_mgr.clear()
 
     ds = load_dataset(path)
+
+    init_from = None
+    if user_cfg.pretrained is not None and resume_state is None:
+        # Fine-tuning from an existing checkpoint. The backbone
+        # architecture and tokenizer must exactly match the pretrained
+        # model (that's what its weights were learned for), so those
+        # fields are locked to the pretrained model's values rather than
+        # auto-configured or user-overridden.
+        if not os.path.exists(user_cfg.pretrained):
+            raise DataError(f"Pretrained model '{user_cfg.pretrained}' does not exist.")
+        pretrained_payload = load_tl(user_cfg.pretrained)
+        pcfg = pretrained_payload["config"]
+
+        locked_fields = [
+            "model_type", "architecture", "d_model", "layers", "heads",
+            "ff_mult", "max_seq_len", "tokenizer", "bpe_vocab_size",
+        ]
+        overrides = {}
+        for field in locked_fields:
+            user_val = getattr(user_cfg, field)
+            pretrained_val = pcfg.get(field)
+            if user_val is not None and user_val != pretrained_val:
+                raise ConfigError(
+                    f"Cannot set {field}={user_val!r} when fine-tuning with "
+                    f"pretrained='{user_cfg.pretrained}' -- the model architecture and "
+                    f"tokenizer must match the pretrained checkpoint exactly "
+                    f"(pretrained {field}={pretrained_val!r}). Omit {field}= to inherit it."
+                )
+            overrides[field] = pretrained_val
+        if user_cfg.task is None:
+            overrides["task"] = pcfg.get("task")
+        user_cfg = dataclasses.replace(user_cfg, **overrides)
+
+        init_from = {
+            "model_state_dict": pretrained_payload["model_state_dict"],
+            "tokenizer_state": pretrained_payload.get("tokenizer_state"),
+            "preprocessor_state": pretrained_payload.get("preprocessor_state"),
+        }
+        if user_cfg.verbose:
+            same_task = user_cfg.task == pcfg.get("task")
+            print(
+                f"[tensorless] fine-tuning from '{user_cfg.pretrained}' "
+                f"(architecture={pcfg.get('architecture')}, d_model={pcfg.get('d_model')}, "
+                f"layers={pcfg.get('layers')})"
+                + ("" if same_task else f" -- task head will be reinitialized for task={user_cfg.task!r}")
+            )
+
     resolved = resolve_config(ds, user_cfg)
     cfg = resolved.to_dict()
 
@@ -145,6 +192,7 @@ def train(path: str, **kwargs: Any) -> LoadedModel:
         checkpoint_mgr=checkpoint_mgr,
         dataset_fingerprint=fingerprint,
         resume_state=resume_state,
+        init_from=init_from,
         log_fn=print if cfg.get("verbose", True) else (lambda *a, **k: None),
     )
 

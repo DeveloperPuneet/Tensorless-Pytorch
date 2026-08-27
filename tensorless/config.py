@@ -42,6 +42,11 @@ class TrainConfig:
     multi_gpu: Optional[bool] = None                # auto-wrap with DataParallel when >1 GPU visible
                                                       # in a single process (e.g. a notebook), so a
                                                       # second GPU doesn't just sit idle
+    pretrained: Optional[str] = None                 # path to a .tl checkpoint to fine-tune from --
+                                                      # initializes weights (backbone only, if the
+                                                      # task head differs) instead of training from
+                                                      # scratch; architecture + tokenizer are locked
+                                                      # to match the pretrained model
 
     # --- optimization ---
     optimizer: Optional[str] = None             # "adamw", "adam", "sgd"
