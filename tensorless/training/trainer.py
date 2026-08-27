@@ -320,6 +320,15 @@ def run_training(
         for batch_index, batch in enumerate(prepared.train_loader):
             with _amp_context(device, cfg["precision"]):
                 loss = _compute_loss(task, model_type, model, batch, device, pad_id)
+            if not torch.isfinite(loss):
+                # A non-finite loss (can happen from fp16 overflow on a
+                # bad batch/step) must never be backpropagated -- doing so
+                # poisons every parameter with NaN permanently. Skip it
+                # and move on instead of corrupting the whole model.
+                if cfg["verbose"]:
+                    log_fn(f"[tensorless] warning: non-finite loss at step {global_step}, skipping batch")
+                optimizer.zero_grad()
+                continue
             last_train_loss = loss.item()
             group_start = batch_index - (batch_index % accumulation_steps)
             group_size = min(accumulation_steps, len(prepared.train_loader) - group_start)
@@ -332,7 +341,15 @@ def run_training(
             if (batch_index + 1) % accumulation_steps == 0 or is_last_batch:
                 if scaler.is_enabled():
                     if cfg["grad_clip"]:
+                        # unscale_ must run before clipping, or clipping
+                        # operates on the fp16 loss-scaled gradients (i.e.
+                        # gradients inflated by up to 2^16x) instead of
+                        # their true magnitude -- which silently makes the
+                        # clip threshold meaningless and lets huge updates
+                        # through, exactly the kind that blow up a model's
+                        # weights into inf/NaN under sustained fp16 training.
                         scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
                     scaler.step(optimizer)
                     scaler.update()
                 else:

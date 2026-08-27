@@ -19,6 +19,8 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
+
+from ..errors import ModelError
 import torch.nn.functional as F
 
 
@@ -71,6 +73,26 @@ class Block(nn.Module):
         x = x + self.attn(self.ln1(x), attn_mask=attn_mask)
         x = x + self.mlp(self.ln2(x))
         return x
+
+
+def _check_finite_logits(logits: torch.Tensor) -> None:
+    """A NaN/Inf logit means the model's weights are themselves corrupted
+    (most commonly: fp16 training without effective gradient clipping,
+    letting a bad update push some weight to inf, which then poisons
+    every subsequent forward pass). Raising here turns an opaque CUDA
+    device-side assert crash inside `torch.multinomial` into a clear,
+    actionable message.
+    """
+    if not torch.isfinite(logits).all():
+        raise ModelError(
+            "This model produced non-finite (NaN/Inf) logits during generation, "
+            "which means its saved weights are corrupted -- not something that can "
+            "be worked around at generation time. This is almost always caused by "
+            "instability during training (e.g. fp16 training diverging). Retrain "
+            "the model to get a usable checkpoint; if training is under your "
+            "control, try a lower learning_rate= and/or precision='bf16' if your "
+            "GPU supports it natively (Ampere or newer)."
+        )
 
 
 class TinyTransformerV1(nn.Module):
@@ -172,6 +194,7 @@ class TinyTransformerV1(nn.Module):
             cond = input_ids[:, -self.max_seq_len:]
             logits = self(cond)
             logits = logits[:, -1, :] / max(temperature, 1e-5)
+            _check_finite_logits(logits)
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float("inf")
@@ -435,6 +458,7 @@ class TinyTransformerV2(nn.Module):
 
         logits = self(prompt, kv_caches=kv_caches, position_offset=0)
         next_logits = logits[:, -1, :]
+        _check_finite_logits(next_logits)
         generated = input_ids
 
         for step in range(max_new_tokens):
@@ -481,6 +505,7 @@ class TinyTransformerV2(nn.Module):
             else:
                 logits = self(next_id, kv_caches=kv_caches, position_offset=position_offset)
             next_logits = logits[:, -1, :]
+            _check_finite_logits(next_logits)
 
         return generated
 
