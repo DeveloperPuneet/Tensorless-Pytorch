@@ -38,7 +38,12 @@ automatically. CUDA training automatically uses `fp16` or `bf16` when
 supported (with gradient scaling and checkpointed scaler state), TPU (XLA)
 training is supported via `device="tpu"`, and large auto-sized models enable
 gradient checkpointing automatically to fit in memory. Reduce `batch_size` if
-memory is limited.
+memory is limited. The model that actually gets saved is always the **best**
+checkpoint seen during training (lowest validation loss, or lowest train loss
+when there's no validation split), not just whatever the final epoch happened
+to land on -- this protects against late-training instability (e.g. a run
+that looks fine for a while and then diverges) silently producing a broken
+saved model. This applies to both `tl.train()` and `tl.pretrain()`.
 
 ## English starter pretraining
 

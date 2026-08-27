@@ -26,6 +26,7 @@ from ..checkpoint.manager import CheckpointManager
 from ..models.registry import build_model
 from ..tokenization import tokenizer_from_state_dict
 from ..data.tabular import TabularPreprocessor
+from ..errors import ModelError
 from .early_stopping import EarlyStopping
 from . import data_prep as dp
 
@@ -269,6 +270,30 @@ def run_training(
     start_epoch = 0
     global_step = 0
 
+    def _ckpt_module() -> nn.Module:
+        return ckpt_model.module if uses_module_wrapper else ckpt_model
+
+    def _state_dict_cpu() -> Dict[str, Any]:
+        return {k: v.detach().cpu().clone() for k, v in _ckpt_module().state_dict().items()}
+
+    # Tracks the single best checkpoint seen so far (lowest val_loss when a
+    # validation split exists, else lowest train_loss), independent of the
+    # live/current weights. This is what actually gets saved at the end --
+    # protects against a run that looks fine for most of training and then
+    # diverges near the end (the loss log tapering off into NaN, which
+    # would otherwise silently produce a broken final checkpoint even
+    # though a perfectly good one existed a few epochs earlier).
+    best_metric = float("inf")
+    best_metric_name: Optional[str] = None
+    best_epoch: Optional[int] = None
+    best_state_dict: Optional[Dict[str, Any]] = None
+
+    def _maybe_update_best(value: Optional[float], name: str, epoch_num: int) -> None:
+        nonlocal best_metric, best_metric_name, best_epoch, best_state_dict
+        if value is not None and math.isfinite(value) and value < best_metric:
+            best_metric, best_metric_name, best_epoch = value, name, epoch_num
+            best_state_dict = _state_dict_cpu()
+
     if resume_state is not None:
         (ckpt_model.module if uses_module_wrapper else ckpt_model).load_state_dict(resume_state["model_state_dict"])
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
@@ -279,6 +304,10 @@ def run_training(
         global_step = resume_state["global_step"]
         early_stopper.best = resume_state.get("early_stopping_best", float("inf"))
         early_stopper.num_bad_checks = resume_state.get("early_stopping_bad_checks", 0)
+        best_metric = resume_state.get("best_metric", float("inf"))
+        best_metric_name = resume_state.get("best_metric_name")
+        best_epoch = resume_state.get("best_epoch")
+        best_state_dict = resume_state.get("best_model_state_dict")
         if cfg["verbose"]:
             log_fn(f"[tensorless] resuming from checkpoint: epoch={start_epoch}, step={global_step}")
 
@@ -296,6 +325,10 @@ def run_training(
             "scaler_state_dict": scaler.state_dict(),
             "early_stopping_best": early_stopper.best,
             "early_stopping_bad_checks": early_stopper.num_bad_checks,
+            "best_metric": best_metric,
+            "best_metric_name": best_metric_name,
+            "best_epoch": best_epoch,
+            "best_model_state_dict": best_state_dict,
             "config": cfg,
             "meta": prepared.meta,
             "tokenizer_state": prepared.tokenizer.state_dict() if prepared.tokenizer else None,
@@ -393,6 +426,7 @@ def run_training(
                     f"train_loss={last_train_loss:.4f} val_loss={val_loss:.4f}"
                     f"{' (best)' if is_best else ''}"
                 )
+            _maybe_update_best(val_loss, "val_loss", epoch + 1)
             if early_stopper.should_stop:
                 if cfg["verbose"]:
                     log_fn(f"[tensorless] early stopping at epoch {epoch + 1} (no improvement)")
@@ -401,6 +435,7 @@ def run_training(
         else:
             if cfg["verbose"]:
                 log_fn(f"[tensorless] epoch {epoch + 1}/{cfg['epochs']} train_loss={last_train_loss:.4f}")
+            _maybe_update_best(last_train_loss, "train_loss", epoch + 1)
 
         _checkpoint(epoch + 1, training_complete=(epoch + 1 >= cfg["epochs"]))
 
@@ -411,13 +446,37 @@ def run_training(
     metrics = {
         "final_train_loss": last_train_loss,
         "final_val_loss": last_val_loss,
+        "best_metric": best_metric if best_state_dict is not None else None,
+        "best_metric_name": best_metric_name,
+        "best_epoch": best_epoch,
         "global_step": global_step,
         "elapsed_seconds": elapsed,
     }
 
+    live_state = _ckpt_module().state_dict()
+    live_is_finite = all(
+        torch.isfinite(v).all() for v in live_state.values() if torch.is_floating_point(v)
+    )
+    if best_state_dict is not None:
+        final_state_dict = best_state_dict
+        if cfg["verbose"]:
+            log_fn(
+                f"[tensorless] using best checkpoint (epoch {best_epoch}, "
+                f"{best_metric_name}={best_metric:.4f}) as the saved model"
+            )
+    elif live_is_finite:
+        final_state_dict = live_state
+    else:
+        raise ModelError(
+            "Training never produced a usable (finite-loss) checkpoint -- every "
+            "recorded epoch had a non-finite loss. Try a lower learning_rate=, a "
+            "different precision (e.g. precision='bf16' on an Ampere+ GPU, or "
+            "precision='fp32'), or check the dataset for problematic examples."
+        )
+
     return {
         "model": model,
-        "model_state_dict": (ckpt_model.module if uses_module_wrapper else ckpt_model).state_dict(),
+        "model_state_dict": final_state_dict,
         "meta": prepared.meta,
         "tokenizer": prepared.tokenizer,
         "preprocessor": prepared.preprocessor,
