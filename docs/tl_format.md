@@ -13,7 +13,7 @@ dictionary:
 ```python
 {
     "tl_format_version": 1,
-    "tensorless_version": "0.1.0",
+   "tensorless_version": "0.9.0",
     "task": "text-generation",         # or text-classification / classification / regression
     "model_type": "transformer",       # or mlp
     "config": { ... },                  # full resolved TrainConfig used
@@ -75,7 +75,7 @@ tensorless info model.tl
 {
   "task": "text-generation",
   "model_type": "transformer",
-  "tensorless_version": "0.1.0",
+   "tensorless_version": "0.9.0",
   "tl_format_version": 1,
   "training_complete": true,
   "metrics": {...},

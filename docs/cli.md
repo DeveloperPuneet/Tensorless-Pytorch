@@ -17,9 +17,11 @@ tensorless train <path> [options]
 | `--layers N` | Number of layers |
 | `--heads N` | Attention heads |
 | `--batch-size N` | Batch size |
+| `--gradient-accumulation-steps N` | Micro-batches per optimizer update |
 | `--epochs N` | Max epochs |
 | `--learning-rate F` | Learning rate |
 | `--device {cpu,cuda,tpu,mps}` | Force a device |
+| `--pretrained PATH` | Initialize from an existing `.tl` model |
 | `--quiet` | Suppress training logs |
 
 For any configuration option not exposed as a CLI flag, use the Python
@@ -30,6 +32,13 @@ Example:
 
 ```bash
 tensorless train ./data --out sentiment.tl --epochs 20 --batch-size 32
+```
+
+Fine-tune from the CLI with the same lifecycle rules as the Python API:
+
+```bash
+tensorless train ./support-chats.jsonl \
+  --pretrained base.tl --out support.tl --epochs 5
 ```
 
 ## `tensorless run`
@@ -74,7 +83,7 @@ fingerprint.
 {
   "task": "classification",
   "model_type": "mlp",
-  "tensorless_version": "0.1.0",
+  "tensorless_version": "0.9.0",
   "tl_format_version": 1,
   "training_complete": true,
   "metrics": {"final_train_loss": 0.42, "final_val_loss": 0.51, "global_step": 96, "elapsed_seconds": 0.14},

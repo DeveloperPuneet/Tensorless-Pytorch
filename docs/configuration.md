@@ -20,6 +20,7 @@ defaults.
 |---|---|---|
 | `task` | auto-detected | `"text-generation"`, `"text-classification"`, `"classification"`, or `"regression"` |
 | `model_type` | auto | `"transformer"` or `"mlp"` |
+| `architecture` | `"v2"` for new transformer runs | Transformer backbone version: `"v1"` for legacy compatibility or `"v2"` (RoPE, RMSNorm, SwiGLU, and cached generation) |
 | `d_model` | auto (scaled to data size) | Hidden dimension |
 | `layers` | auto | Number of transformer blocks / MLP hidden layers |
 | `heads` | auto | Attention heads (transformer only) |
@@ -28,6 +29,11 @@ defaults.
 | `max_seq_len` | `256` (text) / `1` (tabular) | Max sequence length in tokens (text tasks) |
 | `tokenizer` | `"bpe"` | Text tokenizer: `"bpe"` or `"char"` |
 | `bpe_vocab_size` | `1000` | Maximum vocabulary size when `tokenizer="bpe"` |
+| `gradient_checkpointing` | auto | Trade extra compute for lower activation memory on large models |
+| `compile` | auto | Use `torch.compile()` on CUDA when supported |
+| `num_workers` | auto | Number of `DataLoader` worker processes |
+| `multi_gpu` | auto | Use visible GPUs with `DataParallel` in a single process; distributed CLI runs use `torchrun` |
+| `pretrained` | `None` | Path to a `.tl` model whose weights initialize this run |
 
 ## Optimization
 
@@ -57,6 +63,11 @@ defaults.
 |---|---|---|
 | `device` | auto (`tpu` > `cuda` > `mps` > `cpu`) | Force a specific device |
 | `precision` | auto | `"fp32"`, `"fp16"`, or `"bf16"` |
+
+`precision` is selected automatically for the chosen accelerator. It resolves
+to `fp32` on CPU, `bf16` on TPU, and a supported mixed-precision mode on CUDA.
+`compile` and `multi_gpu` are performance controls; they do not change the
+serialized model architecture.
 
 For multi-GPU training, launch the CLI with `torchrun`, for example:
 
@@ -104,3 +115,24 @@ tl.train(
 Passing an unrecognized keyword raises a `ConfigError` listing every
 valid field name, so typos are caught immediately rather than silently
 ignored.
+
+## Fine-tuning a saved model
+
+Pass `pretrained` to initialize a new run from an existing `.tl` file:
+
+```python
+base = tl.train("corpus.txt", task="text-generation", out="base.tl")
+tuned = tl.train(
+    "support-chats.jsonl",
+    task="text-generation",
+    pretrained="base.tl",
+    out="support.tl",
+    epochs=5,
+)
+```
+
+The backbone and tokenizer settings (`model_type`, `architecture`, `d_model`,
+`layers`, `heads`, `ff_mult`, `max_seq_len`, `tokenizer`, and
+`bpe_vocab_size`) are inherited and locked. Supplying a conflicting value
+raises `ConfigError`; omit those fields to inherit them. A different task can
+reuse compatible backbone weights, while its task head is reinitialized.

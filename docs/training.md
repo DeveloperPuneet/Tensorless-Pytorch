@@ -134,7 +134,6 @@ consecutive epochs, training stops early. The automatic default is 3
 consecutive epochs, and the completed model is still written to the `.tl`
 output file.
 
-## Checkpointing during training
 ## Mixed precision
 
 On CUDA, `precision` defaults to `bf16` when the GPU supports it and otherwise

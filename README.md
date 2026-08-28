@@ -135,3 +135,28 @@ print(model.info())
 
 See the [documentation](docs/quickstart.md) for data formats, configuration,
 mixed precision, checkpointing, and the command-line interface.
+
+## Documentation map
+
+- [Installation](docs/installation.md) - requirements, accelerators, and verification
+- [Quick start](docs/quickstart.md) - the shortest path from data to a model
+- [Training](docs/training.md) - supported formats, task behavior, and training controls
+- [Configuration](docs/configuration.md) - every `tl.train()` option
+- [Inference](docs/inference.md) - generation, prediction, chat, and optional web browsing
+- [Checkpointing](docs/checkpointing.md) - resume behavior and checkpoint contents
+- [CLI reference](docs/cli.md) - `tensorless train`, `run`, `inspect`, and `info`
+- [API reference](docs/api_reference.md) - stable Python API and errors
+
+## Version and compatibility
+
+Check the installed version with:
+
+```bash
+python -c "import tensorless; print(tensorless.__version__)"
+```
+
+New training runs use the `v2` transformer architecture. Existing `.tl` files
+retain their saved architecture and remain loadable when the installed format
+supports them. A `.tl` file contains the model weights, tokenizer or tabular
+preprocessor, resolved configuration, and metadata, so the original dataset
+is not required for inference.

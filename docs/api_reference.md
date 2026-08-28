@@ -33,7 +33,18 @@ class InspectionReport:
     stats: Dict[str, Any]
 ```
 
-## `tensorless.load(path, device=None) -> LoadedModel`
+## `tensorless.pretrain(out="english_pretrained.tl", language="english", **kwargs) -> LoadedModel`
+
+Train a text-generation model on the packaged English starter corpus. The
+corpus is intended for demos and smoke tests, not as a general-purpose
+language model. `language` currently accepts only `"english"`; use `train()`
+with your own text corpus for real pretraining.
+
+```python
+model = tl.pretrain(out="english.tl", epochs=20, max_seq_len=128)
+```
+
+## `tensorless.load(path, device=None, internet="off") -> LoadedModel`
 
 Load a trained `.tl` file for inference. `device` overrides the device
 recorded at training time (e.g. load a GPU-trained model on a CPU-only
@@ -42,7 +53,10 @@ machine with `device="cpu"`).
 Raises `tensorless.SerializationError` if the file is missing, corrupt,
 or from an unsupported future format version.
 
-## `tensorless.run(path, prompt=None) -> Any`
+`internet="connect"` enables optional web search for generation calls;
+browsing is off by default. See [inference.md](inference.md#internet-browsing-opt-in-off-by-default).
+
+## `tensorless.run(path, prompt=None, internet="off") -> Any`
 
 Convenience wrapper around `load()` for quick command-line-style usage.
 See [inference.md](inference.md#tlrun--the-cli-friendly-shortcut).
@@ -53,15 +67,18 @@ Returned by both `train()` and `load()`.
 
 | Method | Applies to | Description |
 |---|---|---|
-| `.generate(prompt="", max_new_tokens=200, temperature=0.8, top_k=40)` | `text-generation` | Generate a text continuation |
-| `.chat()` | `text-generation` | Interactive terminal chat loop |
-| `.predict(x)` | all tasks | Unified prediction API; `x` is a string (text tasks) or dict/list-of-dicts (tabular tasks) |
+| `.generate(prompt="", max_new_tokens=200, temperature=0.8, top_k=40, top_p=None, repetition_penalty=1.0, internet=None, internet_max_results=3)` | `text-generation` | Generate a text continuation, optionally using web context |
+| `.chat(internet=None)` | `text-generation` | Interactive terminal chat loop |
+| `.predict(x, internet=None)` | all tasks | Unified prediction API; `x` is a string (text tasks) or dict/list-of-dicts (tabular tasks) |
 | `.info()` | all | Dict summary: task, model type, versions, config, metrics, param count |
 
 Attributes: `.task`, `.model_type`, `.config`, `.meta`, `.metrics`,
-`.dataset_fingerprint`, `.model` (the underlying `torch.nn.Module`),
-`.tokenizer` (`CharTokenizer` or `None`), `.preprocessor`
-(`TabularPreprocessor` or `None`).
+`.dataset_fingerprint`, `.device`, `.model` (the underlying
+`torch.nn.Module`), `.tokenizer` (the trained tokenizer or `None`),
+`.preprocessor` (`TabularPreprocessor` or `None`), and
+`.last_web_sources` (the `SearchResult` objects from the most recent browsing
+call). Use `.set_internet("connect")` or `.set_internet("off")` to change the
+per-model default.
 
 ## `class tensorless.TrainConfig`
 

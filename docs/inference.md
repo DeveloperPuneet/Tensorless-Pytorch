@@ -21,11 +21,24 @@ model = tl.load("model.tl", device="cpu")  # force CPU regardless of training de
 ## Text generation
 
 ```python
-model.generate("Once upon a time", max_new_tokens=200, temperature=0.8, top_k=40)
+model.generate(
+    "Once upon a time",
+    max_new_tokens=200,
+    temperature=0.8,
+    top_k=40,
+    top_p=0.9,
+    repetition_penalty=1.05,
+)
 ```
 
 - `temperature`: higher = more random, lower = more deterministic
 - `top_k`: only sample from the top-k most likely next tokens
+- `top_p`: nucleus sampling threshold; supported by `architecture="v2"`
+- `repetition_penalty`: reduce repeated tokens; supported by `architecture="v2"`
+
+`top_p=None` and `repetition_penalty=1.0` leave those optional `v2` controls
+inactive. Legacy `v1` checkpoints ignore these two arguments and continue to
+use their compatible generation path.
 
 For an interactive terminal chat loop:
 
@@ -100,10 +113,10 @@ model.predict({"age": 35, "income": 95000, "city": "NYC"})
 # regression     -> 349213.5
 ```
 
-Missing columns are imputed the same way they were during training
-(numeric: training-set mean; categorical: a `<missing>` token).
-Categories never seen during training map to an `<unk>` token rather
-than raising an error.
+Missing columns are imputed using the fitted training preprocessor (numeric:
+training-set median; categorical: the learned missing/unknown category).
+Categories never seen during training map to an `<unk>` token rather than
+raising an error. The preprocessor is stored in the `.tl` file.
 
 ## `tl.run()` — the CLI-friendly shortcut
 
@@ -126,7 +139,7 @@ model.info()
 {
     "task": "text-generation",
     "model_type": "transformer",
-    "tensorless_version": "0.1.0",
+    "tensorless_version": "0.9.0",
     "tl_format_version": 1,
     "config": {...},          # the full resolved training config
     "metrics": {...},         # final train/val loss, step count, training time
