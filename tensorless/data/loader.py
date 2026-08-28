@@ -19,11 +19,17 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ..errors import DataError
+from .format_detect import (
+    normalize_records_to_text,
+    looks_textual,
+    flatten_records_to_text,
+)
 
 TEXT_EXTENSIONS = {".txt", ".md"}
 JSON_EXTENSIONS = {".json"}
 JSONL_EXTENSIONS = {".jsonl", ".ndjson"}
 CSV_EXTENSIONS = {".csv", ".tsv"}
+YAML_EXTENSIONS = {".yaml", ".yml"}
 
 # Common field names we look for when a JSON/JSONL record represents a
 # single piece of free text (e.g. for language modeling).
@@ -96,6 +102,31 @@ def _read_jsonl_records(path: str) -> List[Dict[str, Any]]:
     return records
 
 
+def _read_yaml_records(path: str) -> List[Dict[str, Any]]:
+    try:
+        import yaml  # type: ignore
+    except ImportError as e:
+        raise DataError(
+            f"'{path}' is a YAML file, but the optional 'pyyaml' package "
+            f"isn't installed. Run `pip install pyyaml` to load YAML "
+            f"datasets, or convert the file to .json/.jsonl."
+        ) from e
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f)
+    if isinstance(data, dict):
+        for key in ("data", "records", "items", "examples"):
+            if key in data and isinstance(data[key], list):
+                data = data[key]
+                break
+        else:
+            data = [data]
+    if not isinstance(data, list):
+        raise DataError(f"Unsupported YAML structure in '{path}': expected a list of records.")
+    if not all(isinstance(r, dict) for r in data):
+        raise DataError(f"Unsupported YAML structure in '{path}': expected a list of mappings.")
+    return data
+
+
 def _read_csv_records(path: str) -> List[Dict[str, Any]]:
     delimiter = "\t" if path.lower().endswith(".tsv") else ","
     records = []
@@ -134,6 +165,15 @@ def _records_to_dataset(records: List[Dict[str, Any]], source: str) -> Dataset:
             return Dataset(kind="text_labeled", source=source, texts=texts, labels=labels)
         return Dataset(kind="text", source=source, texts=texts)
 
+    # Not a plain {"text": ...} shape -- try recognizing it as chat /
+    # instruction-tuning data instead: turn lists ("messages": [...],
+    # "conversations": [...]) or flat conversational pairs (user/bot,
+    # instruction/output, prompt/completion, etc.), under any of their
+    # common field-name spellings.
+    normalized = normalize_records_to_text(records)
+    if normalized is not None:
+        return Dataset(kind="text", source=source, texts=normalized)
+
     # Otherwise treat as generic tabular data.
     # Preserve column order as it appears in the data (important: the
     # "use the last column as the target" heuristic in auto/detector.py
@@ -145,6 +185,24 @@ def _records_to_dataset(records: List[Dict[str, Any]], source: str) -> Dataset:
             if k not in seen:
                 seen.add(k)
                 columns.append(k)
+
+    # Last resort: the record shape didn't match any known text/chat
+    # convention, but it also doesn't look like a structured table (its
+    # string fields read like free-form prose, not short categorical/
+    # numeric values). Rather than forcing it through the tabular
+    # pipeline -- or raising -- flatten each record into readable
+    # "Key: value" text and train on that. This is what makes truly
+    # arbitrary/unrecognized formats "just work" instead of erroring out.
+    if looks_textual(records):
+        print(
+            f"[tensorless] note: records in '{source}' didn't match a known "
+            f"text/tabular/chat format -- auto-normalizing each record into "
+            f"plain text for language-model training. Pass a recognized "
+            f"format (e.g. a 'text' field, or 'messages'/'user'+'bot' style "
+            f"records) if this isn't what you want."
+        )
+        return Dataset(kind="text", source=source, texts=flatten_records_to_text(records))
+
     return Dataset(kind="tabular", source=source, records=records, columns=columns)
 
 
@@ -197,6 +255,9 @@ def _load_directory(path: str) -> Dataset:
         elif ext in CSV_EXTENSIONS:
             all_records.extend(_read_csv_records(fpath))
             n_files += 1
+        elif ext in YAML_EXTENSIONS:
+            all_records.extend(_read_yaml_records(fpath))
+            n_files += 1
         # silently skip unknown extensions (e.g. README, .gitkeep) -- but
         # never silently skip *data*-looking files; this is only for
         # incidental non-data files.
@@ -215,7 +276,7 @@ def _load_directory(path: str) -> Dataset:
 
     raise DataError(
         f"No supported data files found in '{path}'. Supported: "
-        f".txt, .md, .json, .jsonl, .csv, .tsv"
+        f".txt, .md, .json, .jsonl, .csv, .tsv, .yaml, .yml"
     )
 
 
@@ -248,8 +309,13 @@ def load_dataset(path: str) -> Dataset:
         ds = _records_to_dataset(records, path)
         ds.n_files = 1
         return ds
+    if ext in YAML_EXTENSIONS:
+        records = _read_yaml_records(path)
+        ds = _records_to_dataset(records, path)
+        ds.n_files = 1
+        return ds
 
     raise DataError(
         f"Unsupported file type '{ext}' for '{path}'. Supported: "
-        f".txt, .md, .json, .jsonl, .csv, .tsv, or a directory containing these."
+        f".txt, .md, .json, .jsonl, .csv, .tsv, .yaml, .yml, or a directory containing these."
     )

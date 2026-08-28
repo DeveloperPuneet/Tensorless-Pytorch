@@ -93,6 +93,39 @@ Tabular preprocessing automatically handles numeric values, ISO dates, and
 high-cardinality categories. Missing and rare values are handled using the
 fitted training data, and the same preprocessing is stored in the `.tl` file.
 
+## Flexible data formats
+
+`tl.train()` accepts far more than a single `{"text": "..."}` shape.
+JSON/JSONL/YAML records are auto-detected and normalized, in order: a
+known text field; chat-style turn lists (`"messages"`/`"conversations"`,
+OpenAI- or ShareGPT-style); flat conversational pairs under common aliases
+(`user`/`bot`, `human`/`gpt`, `instruction`/`input`/`output`, `prompt`/
+`completion`, ...); and, as a last resort, any other record is flattened
+into readable text rather than rejected. See
+[docs/training.md](docs/training.md#supported-data-formats) for the full
+list.
+
+```python
+tl.train("chats.jsonl", task="text-generation")  # [{"user": "...", "bot": "..."}, ...] just works
+```
+
+## Internet browsing at inference time
+
+Off by default; turn it on per-call, per-session, or from the CLI to let
+a text-generation model search the web for extra context before
+answering:
+
+```python
+model = tl.load("model.tl")
+model.generate("What's new in PyTorch this week?", internet="connect")
+```
+
+```bash
+tensorless run model.tl --internet connect
+```
+
+See [docs/inference.md](docs/inference.md#internet-browsing-opt-in-off-by-default).
+
 Models are saved as `.tl` files and can be loaded later:
 
 ```python

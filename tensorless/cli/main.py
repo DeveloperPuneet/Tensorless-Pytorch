@@ -38,6 +38,10 @@ def _add_run_parser(subparsers) -> None:
     p = subparsers.add_parser("run", help="Run a trained .tl model")
     p.add_argument("path", help="Path to a .tl model file")
     p.add_argument("--prompt", default=None, help="Input text/prompt (skips interactive chat)")
+    p.add_argument(
+        "--internet", default="off", choices=["off", "connect"],
+        help="Let the model browse the web for extra context before answering (default: off)",
+    )
 
 
 def _add_inspect_parser(subparsers) -> None:
@@ -95,7 +99,7 @@ def main(argv=None) -> int:
             return 0
 
         elif args.command == "run":
-            api.run(args.path, prompt=args.prompt)
+            api.run(args.path, prompt=args.prompt, internet=args.internet)
             return 0
 
         elif args.command == "inspect":

@@ -35,7 +35,7 @@ tensorless train ./data --out sentiment.tl --epochs 20 --batch-size 32
 ## `tensorless run`
 
 ```bash
-tensorless run <model.tl> [--prompt TEXT]
+tensorless run <model.tl> [--prompt TEXT] [--internet {off,connect}]
 ```
 
 - Text-generation model, no `--prompt`: starts an interactive chat.
@@ -46,6 +46,9 @@ tensorless run <model.tl> [--prompt TEXT]
 - Tabular (classification/regression) model: the CLI can't accept
   structured input as a single string, so it prints a pointer to the
   Python API (`tl.load(path).predict({...})`).
+- `--internet connect`: lets a text-generation model search the web for
+  extra context before answering (off by default). In interactive chat,
+  you can also type `internet on` / `internet off` to toggle it.
 
 ## `tensorless inspect`
 

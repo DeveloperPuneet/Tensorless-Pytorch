@@ -11,7 +11,7 @@ expose a task-appropriate prediction API:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Tuple, Union
 
 import torch
 
@@ -21,11 +21,33 @@ from .data.tabular import TabularPreprocessor
 from .devices.device import get_torch_device
 from .errors import ModelError
 from .serialization.tl_format import load_tl
+from .web.browser import browse_for_context, web_search
+
+_INTERNET_ON_VALUES = {"connect", "on", "true", "1", "yes"}
+
+
+def _internet_enabled(value: Union[str, bool, None]) -> bool:
+    """Normalize the many spellings of "turn internet browsing on" a
+    caller might pass (bool, or a string like "connect"/"on"/"off").
+    Internet browsing is opt-in: anything falsy, None, or unrecognized
+    is treated as off.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in _INTERNET_ON_VALUES
 
 
 class LoadedModel:
-    def __init__(self, payload: Dict[str, Any], device: str = None):
+    def __init__(self, payload: Dict[str, Any], device: str = None, internet: Union[str, bool, None] = "off"):
         self.payload = payload
+        # Internet browsing is OFF by default -- a model only searches the
+        # web for a response when this is explicitly turned on, either
+        # here, via `set_internet("connect")`, or per-call with
+        # `generate(..., internet="connect")` / `predict(..., internet="connect")`.
+        self._internet_default = _internet_enabled(internet)
+        self.last_web_sources: List[Any] = []
         self.task: str = payload["task"]
         self.model_type: str = payload["model_type"]
         self.config: Dict[str, Any] = payload["config"]
@@ -50,6 +72,33 @@ class LoadedModel:
         self.model.eval()
 
     # ------------------------------------------------------------------
+    # Internet browsing (opt-in, off by default)
+    # ------------------------------------------------------------------
+    def set_internet(self, internet: Union[str, bool, None]) -> None:
+        """Set the default internet-browsing mode for this loaded model,
+        e.g. `model.set_internet("connect")` / `model.set_internet("off")`.
+        Individual `generate()`/`predict()` calls can still override this
+        per-call via their own `internet=` argument.
+        """
+        self._internet_default = _internet_enabled(internet)
+
+    def _browse(self, query: str, max_results: int = 3, verbose: bool = True) -> str:
+        """Search the web for `query` and return a context block to
+        prepend to the prompt, or "" if nothing could be found (network
+        unreachable, no results, etc.) -- browsing failures never raise,
+        they just silently fall back to answering from the model alone.
+        """
+        self.last_web_sources = []
+        context = browse_for_context(query, max_results=max_results)
+        if context:
+            self.last_web_sources = web_search(query, max_results=max_results)
+            if verbose:
+                print(f"[tensorless] internet=connect -- searched the web for: {query!r}")
+        elif verbose:
+            print(f"[tensorless] internet=connect -- no web results found for: {query!r}; answering from the model alone")
+        return context
+
+    # ------------------------------------------------------------------
     # Text generation
     # ------------------------------------------------------------------
     def generate(
@@ -60,10 +109,29 @@ class LoadedModel:
         top_k: int = 40,
         top_p: float = None,
         repetition_penalty: float = 1.0,
+        internet: Union[str, bool, None] = None,
+        internet_max_results: int = 3,
     ) -> str:
+        """Generate a continuation of `prompt`.
+
+        `internet` controls web browsing for this call: "connect" (or
+        `True`) searches the web for `prompt` and folds the results in as
+        extra context before generating; "off" (or `False`) never
+        browses. Defaults to whatever `set_internet()` last configured
+        (itself off unless explicitly turned on) -- browsing is always
+        opt-in, never automatic.
+        """
         if self.task != "text-generation":
             raise ModelError(f"generate() is only available for text-generation models, not '{self.task}'.")
-        ids = self.tokenizer.encode(prompt, add_special_tokens=True)[:-1]  # drop trailing eos
+
+        use_internet = self._internet_default if internet is None else _internet_enabled(internet)
+        effective_prompt = prompt
+        if use_internet:
+            context = self._browse(prompt, max_results=internet_max_results, verbose=self.config.get("verbose", True))
+            if context:
+                effective_prompt = f"{context}\n\nQuestion: {prompt}\nAnswer:"
+
+        ids = self.tokenizer.encode(effective_prompt, add_special_tokens=True)[:-1]  # drop trailing eos
         if not ids:
             ids = [self.tokenizer.bos_id]
         input_ids = torch.tensor([ids], dtype=torch.long, device=self.device)
@@ -82,20 +150,37 @@ class LoadedModel:
         out = self.model.generate(input_ids, **gen_kwargs)
         return self.tokenizer.decode(out[0].tolist())
 
-    def chat(self) -> None:
-        """Interactive terminal chat loop for text-generation models."""
+    def chat(self, internet: Union[str, bool, None] = None) -> None:
+        """Interactive terminal chat loop for text-generation models.
+
+        Internet browsing defaults to off; pass `internet="connect"` to
+        start with it on, or type `internet on` / `internet off` at the
+        prompt to toggle it mid-conversation.
+        """
         if self.task != "text-generation":
             raise ModelError(f"chat() is only available for text-generation models, not '{self.task}'.")
+        use_internet = self._internet_default if internet is None else _internet_enabled(internet)
         print("Tensorless PyTorch interactive chat. Type 'exit' or Ctrl+C to quit.")
+        print(f"[tensorless] internet browsing: {'on' if use_internet else 'off'} "
+              f"(type 'internet on' / 'internet off' to toggle)")
         while True:
             try:
                 prompt = input("> ")
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
-            if prompt.strip().lower() in ("exit", "quit"):
+            stripped = prompt.strip().lower()
+            if stripped in ("exit", "quit"):
                 break
-            reply = self.generate(prompt, max_new_tokens=200)
+            if stripped in ("internet on", "internet connect"):
+                use_internet = True
+                print("[tensorless] internet browsing: on")
+                continue
+            if stripped == "internet off":
+                use_internet = False
+                print("[tensorless] internet browsing: off")
+                continue
+            reply = self.generate(prompt, max_new_tokens=200, internet=use_internet)
             print(reply)
 
     # ------------------------------------------------------------------
@@ -139,7 +224,7 @@ class LoadedModel:
     # ------------------------------------------------------------------
     # Unified predict()
     # ------------------------------------------------------------------
-    def predict(self, x: Union[str, Dict[str, Any], List[Any]]) -> Any:
+    def predict(self, x: Union[str, Dict[str, Any], List[Any]], internet: Union[str, bool, None] = None) -> Any:
         single = not isinstance(x, list)
         items = [x] if single else x
 
@@ -148,7 +233,7 @@ class LoadedModel:
         elif self.task in ("classification", "regression"):
             preds = self._predict_tabular(items)
         elif self.task == "text-generation":
-            preds = [self.generate(prompt=str(i)) for i in items]
+            preds = [self.generate(prompt=str(i), internet=internet) for i in items]
         else:
             raise ModelError(f"predict() not supported for task '{self.task}'.")
 
@@ -164,9 +249,10 @@ class LoadedModel:
             "metrics": self.metrics,
             "training_complete": self.payload.get("training_complete"),
             "n_parameters": sum(p.numel() for p in self.model.parameters()),
+            "internet": "on" if self._internet_default else "off",
         }
 
 
-def load_model(path: str, device: str = None) -> LoadedModel:
+def load_model(path: str, device: str = None, internet: Union[str, bool, None] = "off") -> LoadedModel:
     payload = load_tl(path)
-    return LoadedModel(payload, device=device)
+    return LoadedModel(payload, device=device, internet=internet)

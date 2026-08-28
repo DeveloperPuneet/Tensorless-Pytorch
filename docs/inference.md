@@ -39,6 +39,46 @@ or from the shell:
 tensorless run model.tl
 ```
 
+## Internet browsing (opt-in, off by default)
+
+A loaded text-generation model can optionally search the web for extra
+context before answering:
+
+```python
+model = tl.load("model.tl")                       # internet is off by default
+model.generate("What's today's exchange rate?", internet="connect")
+```
+
+`internet="connect"` (or `internet=True`) performs a lightweight web
+search for the prompt and folds the top results in as context before the
+model generates; `internet="off"` (the default) never touches the
+network. You can also set it once for the whole session:
+
+```python
+model = tl.load("model.tl", internet="connect")   # on for every call from now on
+model.set_internet("off")                          # or toggle it later
+```
+
+`model.chat()` supports the same switch, and can also be toggled mid
+conversation by typing `internet on` / `internet off` at the prompt:
+
+```python
+model.chat(internet="connect")
+```
+
+```bash
+tensorless run model.tl --internet connect
+```
+
+After a call that used it, `model.last_web_sources` holds the
+`SearchResult` objects (`title`, `url`, `snippet`) that were retrieved,
+so you can show citations alongside the generated text. Browsing never
+raises: if the network is unreachable or nothing relevant turns up, it
+silently falls back to answering from the model alone (with a one-line
+note printed when `verbose=True`). It relies only on the Python standard
+library (no extra dependency to install), and works with `.predict()` on
+text-generation models too (`model.predict(text, internet="connect")`).
+
 ## Text classification
 
 ```python
@@ -92,6 +132,7 @@ model.info()
     "metrics": {...},         # final train/val loss, step count, training time
     "training_complete": True,
     "n_parameters": 412673,
+    "internet": "off",        # current internet-browsing mode for this model
 }
 ```
 

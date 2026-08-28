@@ -12,6 +12,37 @@ Returns a `LoadedModel` (see [inference.md](inference.md)) ready for
 predictions, and writes `model.tl` (plus a `model.tl.ckpt/` checkpoint
 directory) to the current directory.
 
+## What gets printed at startup
+
+Before training begins (when `verbose=True`, the default), Tensorless
+prints every resolved configuration value -- architecture, optimization,
+validation, hardware, checkpointing -- tagged with how it was decided:
+
+- **`(manual)`** — you passed it explicitly, as a `tl.train(...)` keyword
+  argument or a CLI flag.
+- **`(auto)`** — chosen automatically from dataset size and detected
+  hardware (see [automatic_mode.md](automatic_mode.md)).
+- **`(locked)`** — forced to match a `pretrained=` checkpoint's
+  architecture/tokenizer when fine-tuning.
+
+```
+[tensorless] ===== training configuration =====
+[tensorless] -- task / architecture --
+[tensorless]   task                         = 'text-generation' (auto)
+[tensorless]   d_model                      = 512          (manual)
+[tensorless]   ff_mult                      = 4            (auto)
+...
+[tensorless] 3 manual, 34 auto -- 37 parameters total
+[tensorless] ===================================
+```
+
+This makes the "fully automatic by default" behavior inspectable rather
+than a black box: you can see at a glance exactly which numbers Tensorless
+picked for you and which ones you're overriding. Pass `verbose=False` to
+suppress this (and all other) training output. Resumed runs print a
+shorter note instead, since a resumed run keeps the exact configuration
+the checkpoint was originally created with.
+
 ## Supported data formats
 
 | Format | Notes |
@@ -20,23 +51,49 @@ directory) to the current directory.
 | `.csv`, `.tsv` | Tabular; first row is the header |
 | `.json` | A list of records, or `{"data": [...]}` / `{"records": [...]}` |
 | `.jsonl`, `.ndjson` | One JSON object per line |
+| `.yaml`, `.yml` | Same record shapes as `.json` (requires `pip install pyyaml`) |
 | A directory of the above | Merged; see below |
 | A directory of class subfolders of `.txt`/`.md` files | Text classification, folder name = label |
 
-For JSON/JSONL records, Tensorless PyTorch looks for a field named `text`,
-`content`, `body`, `document`, or `sentence` to treat as the input text,
-and `label`, `target`, `class`, `category`, or `y` for the label if
-present. If a text field is found but no label field, it's a
-text-generation dataset. If both are found, it's text classification.
+For JSON/JSONL/YAML records, Tensorless PyTorch tries several
+interpretations, in order, and uses the first one that fits:
 
-For CSV/TSV/JSON/JSONL without a text field, records are treated as
-tabular data (see [automatic_mode.md](automatic_mode.md) for how the
-target column and task type are chosen).
+1. **A single text field.** A field named `text`, `content`, `body`,
+   `document`, or `sentence` is treated as the input text, and `label`,
+   `target`, `class`, `category`, or `y` as the label if present. Text
+   field only -> text-generation. Text + label -> text-classification.
+2. **Chat / turn-list records**, e.g. OpenAI-style
+   `{"messages": [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]}`
+   or ShareGPT-style
+   `{"conversations": [{"from": "human", "value": "..."}, {"from": "gpt", "value": "..."}]}`.
+   Also recognized under the aliases `turns`, `dialogue`, `dialog`, `chat`,
+   and role names `user`/`human`/`question`/`prompt`/`instruction`/`input`
+   and `assistant`/`bot`/`ai`/`gpt`/`answer`/`response`/`output`/`completion`/`reply`.
+3. **Flat conversational pairs**, e.g. `{"user": "...", "bot": "..."}`,
+   `{"human": "...", "gpt": "..."}`, `{"question": "...", "answer": "..."}`,
+   `{"prompt": "...", "completion": "..."}`, or Alpaca-style
+   `{"instruction": "...", "input": "...", "output": "..."}`. Any of the
+   role aliases from (2) work here too, and an optional `system`/`context`
+   field is included as a leading system turn. These are all normalized
+   into `"User: ...\nAssistant: ..."`-style text and trained as
+   text-generation (chat fine-tuning).
+4. **Anything else that looks like free text** (records whose string
+   fields read like prose rather than short table cells) is flattened
+   into readable `"Key: value"` text and trained as text-generation,
+   rather than being forced into the tabular pipeline or rejected. A
+   one-line notice is printed when this fallback is used, since it's a
+   best-effort guess at an unfamiliar format.
+
+Only if none of the above apply -- i.e. the records genuinely look like a
+structured table (short/numeric values, no recognizable text or chat
+fields) -- are they treated as tabular data (see
+[automatic_mode.md](automatic_mode.md) for how the target column and task
+type are chosen).
 
 A directory can mix multiple files of the *same* format (e.g. several
 `.csv` files, or several `.txt` files) — they're concatenated. Mixing
-plain text files with structured (JSON/CSV) files in the same directory
-raises a `DataError` asking you to separate them.
+plain text files with structured (JSON/CSV/YAML) files in the same
+directory raises a `DataError` asking you to separate them.
 
 For tabular data, numeric columns are robustly scaled and missing values use
 the training median. ISO-8601 date and datetime columns are converted to

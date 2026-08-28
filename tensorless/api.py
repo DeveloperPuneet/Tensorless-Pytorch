@@ -28,6 +28,7 @@ from .checkpoint.manager import CheckpointManager
 from .training.trainer import run_training
 from .serialization.tl_format import save_tl, load_tl
 from .runtime import LoadedModel, load_model
+from .reporting import print_config_report, print_resumed_config_report
 from ._version import __version__ as _tl_version, TL_FORMAT_VERSION as _tl_format_version
 
 _KNOWN_FIELDS = {f.name for f in dataclasses.fields(TrainConfig)}
@@ -132,6 +133,7 @@ def train(path: str, **kwargs: Any) -> LoadedModel:
     ds = load_dataset(path)
 
     init_from = None
+    pretrained_locked_fields: set = set()
     if user_cfg.pretrained is not None and resume_state is None:
         # Fine-tuning from an existing checkpoint. The backbone
         # architecture and tokenizer must exactly match the pretrained
@@ -161,6 +163,7 @@ def train(path: str, **kwargs: Any) -> LoadedModel:
             overrides[field] = pretrained_val
         if user_cfg.task is None:
             overrides["task"] = pcfg.get("task")
+        pretrained_locked_fields = set(overrides.keys())
         user_cfg = dataclasses.replace(user_cfg, **overrides)
 
         init_from = {
@@ -185,6 +188,10 @@ def train(path: str, **kwargs: Any) -> LoadedModel:
         # originally, regardless of any new overrides, so the checkpoint
         # can actually be loaded.
         cfg = resume_state["config"]
+        if cfg.get("verbose", True):
+            print_resumed_config_report(cfg)
+    elif cfg.get("verbose", True):
+        print_config_report(cfg, manual_fields=set(kwargs.keys()), locked_fields=pretrained_locked_fields)
 
     result = run_training(
         ds=ds,
@@ -253,19 +260,26 @@ def _finalize_from_checkpoint(ckpt: dict, out: str, verbose: bool) -> LoadedMode
     return LoadedModel(payload)
 
 
-def load(path: str, device: Optional[str] = None) -> LoadedModel:
-    """Load a trained `.tl` model for inference."""
-    return load_model(path, device=device)
+def load(path: str, device: Optional[str] = None, internet: Any = "off") -> LoadedModel:
+    """Load a trained `.tl` model for inference.
+
+    `internet` controls whether the model is allowed to browse the web
+    for extra context when generating (`.generate()`/`.predict()`/
+    `.chat()`). Off by default; pass `internet="connect"` to turn it on,
+    or call `.set_internet(...)` on the returned model later.
+    """
+    return load_model(path, device=device, internet=internet)
 
 
-def run(path: str, prompt: Optional[str] = None) -> Any:
+def run(path: str, prompt: Optional[str] = None, internet: Any = "off") -> Any:
     """Run a trained `.tl` model.
 
     For text-generation models with no prompt given, starts an
     interactive terminal chat. Otherwise runs one generation/prediction
-    and returns/prints the result.
+    and returns/prints the result. `internet="connect"` lets the model
+    browse the web for extra context (off by default).
     """
-    model = load_model(path)
+    model = load_model(path, internet=internet)
     if model.task == "text-generation":
         if prompt is None:
             model.chat()
