@@ -18,6 +18,7 @@ never breaks because the internet was flaky or unreachable.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 import socket
 import urllib.error
@@ -33,6 +34,68 @@ _USER_AGENT = (
 )
 _SEARCH_URL = "https://html.duckduckgo.com/html/"
 _DEFAULT_TIMEOUT = 6.0
+_ALLOWED_SCHEMES = {"http", "https"}
+# Cap how much of a response we read: a short context snippet never needs
+# more than a fraction of this, and without a cap a malicious/misbehaving
+# server could send an unbounded response and exhaust memory.
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024  # 2 MB
+
+
+class _UnsafeUrlError(Exception):
+    """Internal: a URL failed the scheme/SSRF safety checks in `_get`.
+    Every caller catches this alongside ordinary network errors, so an
+    unsafe URL fails the same soft, no-exception way a timeout would --
+    this is a "don't browse there" outcome, not something that should
+    ever propagate out of this optional, best-effort feature.
+    """
+
+
+def _check_url_is_safe(url: str) -> None:
+    """Reject anything that isn't a plain http(s) fetch of a public host.
+
+    Search-result URLs (and any URL that reaches this function generally)
+    are not trusted input:
+      - without a scheme check, `file://`, `ftp://`, or similar would let
+        `urlopen` read local files or reach unintended protocols;
+      - without resolving the hostname and checking the IP, a hostname
+        that resolves to loopback/private/link-local addresses (e.g.
+        127.0.0.1, 169.254.169.254 -- the AWS/GCP/Azure metadata service
+        IP -- or an internal 10.x/192.168.x host) would let this
+        "browse the web" feature be turned into a way to probe or reach
+        services that were never meant to be internet-facing (SSRF).
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        raise _UnsafeUrlError(f"unsupported URL scheme: {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise _UnsafeUrlError("URL has no host")
+    try:
+        addrinfo = socket.getaddrinfo(host, None)
+    except socket.gaierror as e:
+        raise _UnsafeUrlError(f"could not resolve host {host!r}: {e}") from e
+    for _family, _type, _proto, _canon, sockaddr in addrinfo:
+        ip = ipaddress.ip_address(sockaddr[0])
+        if (
+            ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        ):
+            raise _UnsafeUrlError(f"host {host!r} resolves to a non-public address ({ip})")
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-validates every redirect target with `_check_url_is_safe` before
+    following it. Without this, a request that starts at a safe, public
+    URL could still be redirected server-side to a `file://` URL or an
+    internal address, bypassing the check in `_get` entirely.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_url_is_safe(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_opener = urllib.request.build_opener(_SafeRedirectHandler)
 
 
 @dataclass
@@ -120,9 +183,10 @@ class _ResultLinkParser(HTMLParser):
 
 
 def _get(url: str, timeout: float, data: Optional[bytes] = None) -> str:
+    _check_url_is_safe(url)
     req = urllib.request.Request(url, data=data, headers={"User-Agent": _USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
+    with _opener.open(req, timeout=timeout) as resp:
+        raw = resp.read(_MAX_RESPONSE_BYTES + 1)[:_MAX_RESPONSE_BYTES]
         charset = resp.headers.get_content_charset() or "utf-8"
         return raw.decode(charset, errors="replace")
 
@@ -140,7 +204,7 @@ def web_search(
     try:
         body = urllib.parse.urlencode({"q": query}).encode("utf-8")
         html = _get(_SEARCH_URL, timeout=timeout, data=body)
-    except (urllib.error.URLError, socket.timeout, OSError, ValueError):
+    except (urllib.error.URLError, socket.timeout, OSError, ValueError, _UnsafeUrlError):
         return []
     parser = _ResultLinkParser()
     try:
@@ -152,11 +216,12 @@ def web_search(
 
 def fetch_page_text(url: str, timeout: float = _DEFAULT_TIMEOUT, max_chars: int = 1500) -> str:
     """Fetch `url` and return its visible text, truncated to `max_chars`.
-    Returns "" on any failure (unreachable host, non-HTML content, etc.).
+    Returns "" on any failure (unreachable host, non-HTML content, an
+    unsafe/non-public URL, etc.).
     """
     try:
         html = _get(url, timeout=timeout)
-    except (urllib.error.URLError, socket.timeout, OSError, ValueError):
+    except (urllib.error.URLError, socket.timeout, OSError, ValueError, _UnsafeUrlError):
         return ""
     extractor = _TextExtractor()
     try:

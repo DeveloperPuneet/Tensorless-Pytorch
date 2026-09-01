@@ -9,8 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
-from .loader import load_dataset, Dataset
 from .fingerprint import fingerprint_path
+from .loader import Dataset, load_dataset
 
 
 @dataclass

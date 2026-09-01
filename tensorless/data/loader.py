@@ -20,9 +20,9 @@ from typing import Any, Dict, List, Optional
 
 from ..errors import DataError
 from .format_detect import (
-    normalize_records_to_text,
-    looks_textual,
     flatten_records_to_text,
+    looks_textual,
+    normalize_records_to_text,
 )
 
 TEXT_EXTENSIONS = {".txt", ".md"}
@@ -161,7 +161,7 @@ def _records_to_dataset(records: List[Dict[str, Any]], source: str) -> Dataset:
     if text_field_present:
         texts = [_extract_text_field(r) or "" for r in records]
         labels = [_extract_label_field(r) for r in records]
-        if any(l is not None for l in labels):
+        if any(label is not None for label in labels):
             return Dataset(kind="text_labeled", source=source, texts=texts, labels=labels)
         return Dataset(kind="text", source=source, texts=texts)
 
@@ -218,8 +218,10 @@ def _load_directory(path: str) -> Dataset:
     if subdirs and not files:
         texts, labels = [], []
         n_files = 0
+        empty_labels = []
         for label in subdirs:
             sub = os.path.join(path, label)
+            n_before = len(texts)
             for fname in sorted(os.listdir(sub)):
                 fpath = os.path.join(sub, fname)
                 if not os.path.isfile(fpath):
@@ -229,9 +231,22 @@ def _load_directory(path: str) -> Dataset:
                     texts.append(_read_text_file(fpath))
                     labels.append(label)
                     n_files += 1
+            if len(texts) == n_before:
+                empty_labels.append(label)
         if not texts:
             raise DataError(
                 f"Directory '{path}' contains subfolders but no readable .txt files inside them."
+            )
+        # Strict validation: a class subfolder with no readable text files
+        # would otherwise silently vanish as a class rather than raising --
+        # producing a dataset with fewer labels than the directory
+        # structure implies, with no indication anything was dropped.
+        if empty_labels:
+            names = ", ".join(f"'{label}'" for label in empty_labels)
+            raise DataError(
+                f"Class subfolder(s) {names} in '{path}' contain no readable "
+                f".txt files -- every class subfolder must have at least one "
+                f"text file. Remove the empty subfolder(s) or add data to them."
             )
         ds = Dataset(kind="text_labeled", source=path, texts=texts, labels=labels, n_files=n_files)
         return ds

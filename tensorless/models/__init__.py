@@ -1,6 +1,6 @@
+from .mlp import TabularMLP, TabularMLPV1, TabularMLPV2
 from .registry import build_model
 from .transformer import TinyTransformer, TinyTransformerV1, TinyTransformerV2
-from .mlp import TabularMLP, TabularMLPV1, TabularMLPV2
 
 __all__ = [
     "build_model",

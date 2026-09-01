@@ -14,7 +14,7 @@ def test_full_end_to_end_pipeline(text_corpus, workdir):
     report = tl.inspect(text_corpus)
     assert report.task == "text-generation"
 
-    model = tl.train(text_corpus, out="e2e.tl", **TINY_TEXT_KWARGS)
+    tl.train(text_corpus, out="e2e.tl", **TINY_TEXT_KWARGS)
     assert os.path.isfile("e2e.tl")
     assert os.path.isdir("e2e.tl.ckpt")
 

@@ -13,8 +13,8 @@ directly inside a `.tl` file and reproduced exactly at inference time.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch

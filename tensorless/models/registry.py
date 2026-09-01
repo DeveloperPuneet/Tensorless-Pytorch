@@ -21,9 +21,9 @@ from typing import Any, Dict
 
 import torch.nn as nn
 
-from .transformer import TinyTransformerV1, TinyTransformerV2
-from .mlp import TabularMLPV1, TabularMLPV2
 from ..errors import ModelError
+from .mlp import TabularMLPV1, TabularMLPV2
+from .transformer import TinyTransformerV1, TinyTransformerV2
 
 
 def build_model(task: str, model_type: str, cfg: Dict[str, Any], meta: Dict[str, Any]) -> nn.Module:

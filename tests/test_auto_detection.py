@@ -1,5 +1,5 @@
-from tensorless.data.loader import load_dataset
 from tensorless.auto.detector import detect_task
+from tensorless.data.loader import load_dataset
 
 
 def test_detect_text_generation(text_corpus):

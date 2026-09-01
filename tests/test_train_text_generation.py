@@ -1,11 +1,10 @@
 import os
 
 import tensorless as tl
-from tensorless.tokenization.bpe_tokenizer import BPETokenizer
-from tensorless.serialization.tl_format import load_tl
 from tensorless.auto.config import resolve_config
 from tensorless.config import TrainConfig
 from tensorless.data.loader import Dataset
+from tensorless.tokenization.bpe_tokenizer import BPETokenizer
 from tensorless.training.data_prep import prepare_text_generation
 
 from .conftest import TINY_TEXT_KWARGS

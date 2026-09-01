@@ -1,7 +1,7 @@
 from .device import (
     auto_select_device,
-    get_torch_device,
     get_device_info,
+    get_torch_device,
     mark_step,
     recommend_max_params,
     tpu_core_count,

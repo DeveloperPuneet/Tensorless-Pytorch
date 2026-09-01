@@ -1,6 +1,6 @@
-from .loader import load_dataset, Dataset
 from .fingerprint import fingerprint_path
-from .inspector import inspect_path, InspectionReport
+from .inspector import InspectionReport, inspect_path
+from .loader import Dataset, load_dataset
 
 __all__ = [
     "load_dataset",

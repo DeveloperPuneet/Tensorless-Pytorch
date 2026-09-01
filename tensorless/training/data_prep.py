@@ -13,16 +13,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch.utils.data import DataLoader, Dataset as TorchDataset, IterableDataset
-from torch.utils.data.distributed import DistributedSampler
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data.distributed import DistributedSampler
 
+from ..auto.detector import target_column
 from ..data.loader import Dataset
 from ..data.tabular import TabularPreprocessor
+from ..errors import DataError
 from ..tokenization.bpe_tokenizer import BPETokenizer
 from ..tokenization.char_tokenizer import CharTokenizer
-from ..auto.detector import target_column
-from ..errors import DataError
 
 
 @dataclass
@@ -268,11 +269,22 @@ def prepare_tabular(
     if target_col is None:
         raise DataError("Could not determine a target column for tabular training.")
 
-    prep = preprocessor or TabularPreprocessor().fit(ds.records, ds.columns, target_col, task)
-    transformed = prep.transform(ds.records, with_target=True)
-
-    n = transformed["numeric"].shape[0]
+    n = len(ds.records)
     train_idx, val_idx = _split_indices(n, cfg["val_split"], cfg["seed"])
+
+    # Fit preprocessing statistics (numeric median/MAD, categorical
+    # vocabularies, target mean/std or class list) on the *training*
+    # split only. Fitting on the full dataset (including what becomes the
+    # validation split) would leak validation-set statistics into the
+    # features/targets used to train the model, making the validation
+    # loss an overly-optimistic estimate of generalization.
+    if preprocessor is not None:
+        prep = preprocessor
+    else:
+        train_records = [ds.records[i] for i in train_idx]
+        prep = TabularPreprocessor().fit(train_records, ds.columns, target_col, task)
+
+    transformed = prep.transform(ds.records, with_target=True)
     train_idx_t = torch.tensor(train_idx, dtype=torch.long)
 
     train_ds = _TabularDataset(

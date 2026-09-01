@@ -14,22 +14,23 @@ from __future__ import annotations
 import dataclasses
 import importlib.resources
 import os
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 import torch.distributed as dist
 
-from .config import TrainConfig
-from .errors import ConfigError, DataError, ModelError
-from .data.loader import load_dataset
-from .data.fingerprint import fingerprint_path
-from .data.inspector import inspect_path, InspectionReport
+from ._version import TL_FORMAT_VERSION as _tl_format_version
+from ._version import __version__ as _tl_version
 from .auto.config import resolve_config
 from .checkpoint.manager import CheckpointManager
-from .training.trainer import run_training
-from .serialization.tl_format import save_tl, load_tl
-from .runtime import LoadedModel, load_model
+from .config import TrainConfig
+from .data.fingerprint import fingerprint_path
+from .data.inspector import InspectionReport, inspect_path
+from .data.loader import load_dataset
+from .errors import ConfigError, DataError, ModelError
 from .reporting import print_config_report, print_resumed_config_report
-from ._version import __version__ as _tl_version, TL_FORMAT_VERSION as _tl_format_version
+from .runtime import LoadedModel, load_model
+from .serialization.tl_format import load_tl, save_tl
+from .training.trainer import run_training
 
 _KNOWN_FIELDS = {f.name for f in dataclasses.fields(TrainConfig)}
 
@@ -41,7 +42,40 @@ def _build_train_config(**kwargs: Any) -> TrainConfig:
             f"Unknown train() argument(s): {sorted(unknown)}. "
             f"Valid arguments: {sorted(_KNOWN_FIELDS)}"
         )
-    return TrainConfig(**kwargs)
+    cfg = TrainConfig(**kwargs)
+    cfg.validate()
+    return cfg
+
+
+# Fields that don't describe *model/training* configuration and should
+# never invalidate a cached model or checkpoint just because they differ
+# between calls (lifecycle/output knobs, not "what was trained").
+_CACHE_IGNORED_FIELDS = {
+    "force", "resume", "ask_on_data_change", "out", "checkpoint_dir",
+    "verbose", "extra",
+}
+
+
+def _conflicting_override(cached_cfg: Dict[str, Any], kwargs: Dict[str, Any]) -> Optional[str]:
+    """Return the name of the first user-supplied kwarg whose value
+    disagrees with what a cached `.tl`/checkpoint was actually produced
+    with, or None if there's no conflict.
+
+    Only kwargs the caller *explicitly* passed this call are checked --
+    fields that were auto-resolved are allowed to differ across runs
+    (e.g. as auto-config heuristics change) without invalidating a cache
+    that's otherwise a perfectly valid match for this exact dataset. This
+    is what makes the "Smart Auto Check" configuration-aware rather than
+    purely dataset-fingerprint-based: a cached model trained with
+    `d_model=512` should never be silently handed back for a call that
+    explicitly asked for `d_model=256`.
+    """
+    for field_name, requested in kwargs.items():
+        if field_name in _CACHE_IGNORED_FIELDS or field_name not in cached_cfg:
+            continue
+        if cached_cfg[field_name] != requested:
+            return field_name
+    return None
 
 
 def inspect(path: str) -> InspectionReport:
@@ -87,29 +121,63 @@ def train(path: str, **kwargs: Any) -> LoadedModel:
             existing = None
         if existing is not None:
             if existing.get("dataset_fingerprint") == fingerprint and existing.get("training_complete"):
-                if user_cfg.verbose:
+                conflict = _conflicting_override(existing.get("config", {}), kwargs)
+                if conflict is None:
+                    if user_cfg.verbose:
+                        print(
+                            f"[tensorless] '{out}' already exists and matches this "
+                            f"dataset (fingerprint {fingerprint[:12]}...) -- using "
+                            f"the existing model. Pass force=True to retrain."
+                        )
+                    return LoadedModel(existing)
+                elif user_cfg.verbose:
                     print(
-                        f"[tensorless] '{out}' already exists and matches this "
-                        f"dataset (fingerprint {fingerprint[:12]}...) -- using "
-                        f"the existing model. Pass force=True to retrain."
+                        f"[tensorless] '{out}' matches this dataset but was trained with "
+                        f"{conflict}={existing['config'].get(conflict)!r}, which conflicts "
+                        f"with the requested {conflict}={kwargs[conflict]!r} -- retraining."
                     )
-                return LoadedModel(existing)
 
         # 2. Is there an interrupted / matching checkpoint to resume from?
+        #
+        # A conflicting kwarg is treated differently depending on
+        # whether the checkpoint represents *finished* training or an
+        # *in-progress* run:
+        #   - finished (training_complete=True): equivalent to the
+        #     ".tl already exists" case above -- a conflicting override
+        #     means this checkpoint is not what was asked for, so it
+        #     must not be silently finalized and returned.
+        #   - in-progress: resuming always keeps the checkpoint's
+        #     original config wholesale (see `resume_state` handling
+        #     below) since the in-progress weights are shape-bound to
+        #     that architecture and any override would be discarded
+        #     anyway -- so conflicts here don't block resuming.
         if checkpoint_mgr.exists() and user_cfg.resume is not False:
             ckpt = checkpoint_mgr.load()
             if ckpt.get("dataset_fingerprint") == fingerprint:
                 if ckpt.get("training_complete"):
-                    # Training finished but the final .tl wasn't written
-                    # (e.g. process died right after the last checkpoint).
-                    # No need to retrain -- just package the .tl file.
-                    return _finalize_from_checkpoint(ckpt, out, user_cfg.verbose)
-                resume_state = ckpt
-                if user_cfg.verbose:
-                    print(
-                        f"[tensorless] found an interrupted checkpoint for this "
-                        f"exact dataset -- resuming training."
-                    )
+                    conflict = _conflicting_override(ckpt.get("config", {}), kwargs)
+                    if conflict is not None:
+                        if user_cfg.verbose:
+                            print(
+                                f"[tensorless] existing checkpoint for '{out}' finished "
+                                f"training with {conflict}={ckpt['config'].get(conflict)!r}, "
+                                f"which conflicts with the requested "
+                                f"{conflict}={kwargs[conflict]!r} -- retraining."
+                            )
+                        checkpoint_mgr.clear()
+                    else:
+                        # Training finished but the final .tl wasn't
+                        # written (e.g. process died right after the
+                        # last checkpoint). No need to retrain -- just
+                        # package the .tl file.
+                        return _finalize_from_checkpoint(ckpt, out, user_cfg.verbose)
+                else:
+                    resume_state = ckpt
+                    if user_cfg.verbose:
+                        print(
+                            "[tensorless] found an interrupted checkpoint for this "
+                            "exact dataset -- resuming training."
+                        )
             else:
                 if user_cfg.ask_on_data_change:
                     raise ConfigError(

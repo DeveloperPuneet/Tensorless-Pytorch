@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import heapq
 import random
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 from .char_tokenizer import BOS, EOS, PAD, SPECIAL_TOKENS, UNK
 

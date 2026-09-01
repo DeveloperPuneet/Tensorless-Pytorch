@@ -31,7 +31,7 @@ from typing import Any, Dict
 
 import torch
 
-from .._version import __version__, TL_FORMAT_VERSION
+from .._version import TL_FORMAT_VERSION, __version__
 from ..errors import SerializationError
 
 REQUIRED_KEYS = (
@@ -93,7 +93,15 @@ def load_tl(path: str, map_location: str = "cpu") -> Dict[str, Any]:
     if not os.path.isfile(path):
         raise SerializationError(f"'{path}' does not exist.")
     try:
-        payload = torch.load(path, map_location=map_location, weights_only=False)
+        # `.tl` files are explicitly designed to be shared (see the module
+        # docstring: "scp/email/upload one model.tl"), which means loading
+        # one is loading a file from someone else's machine. `torch.load`
+        # with `weights_only=False` unpickles arbitrary Python objects and
+        # can be made to execute arbitrary code via a crafted pickle --
+        # `weights_only=True` restricts deserialization to a safe, known
+        # set of types (tensors, dicts, lists, strings, numbers, etc.),
+        # which is all a `.tl` payload actually contains.
+        payload = torch.load(path, map_location=map_location, weights_only=True)
     except Exception as e:
         raise SerializationError(f"Failed to read .tl file '{path}': {e}") from e
 

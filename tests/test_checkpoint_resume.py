@@ -1,11 +1,11 @@
 import os
 
 import tensorless as tl
-from tensorless.data.loader import load_dataset
-from tensorless.data.fingerprint import fingerprint_path
 from tensorless.auto.config import resolve_config
-from tensorless.config import TrainConfig
 from tensorless.checkpoint.manager import CheckpointManager
+from tensorless.config import TrainConfig
+from tensorless.data.fingerprint import fingerprint_path
+from tensorless.data.loader import load_dataset
 from tensorless.training.trainer import run_training
 
 from .conftest import TINY_TEXT_KWARGS

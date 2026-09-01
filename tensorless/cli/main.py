@@ -9,12 +9,20 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
+import typing
 
 from .. import api
+from ..config import TrainConfig
 from ..errors import TensorlessError
 from ..serialization.tl_format import load_tl
+
+# Fields handled by their own hand-written flags below (either because they
+# need special argparse behavior, like `path`/`--force`/`--quiet`, or
+# because exposing them on the CLI wouldn't make sense, like `extra`).
+_HANDPICKED_FIELDS = {"out", "force", "verbose", "extra"}
 
 
 def _add_train_parser(subparsers) -> None:
@@ -22,16 +30,40 @@ def _add_train_parser(subparsers) -> None:
     p.add_argument("path", help="Path to a dataset file or directory")
     p.add_argument("--out", default=None, help="Output .tl file path (default: model.tl)")
     p.add_argument("--force", action="store_true", help="Force retraining even if a matching model exists")
-    p.add_argument("--d-model", type=int, default=None, dest="d_model")
-    p.add_argument("--layers", type=int, default=None)
-    p.add_argument("--heads", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=None, dest="batch_size")
-    p.add_argument("--gradient-accumulation-steps", type=int, default=None)
-    p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--learning-rate", type=float, default=None, dest="learning_rate")
-    p.add_argument("--device", default=None, choices=["cpu", "cuda", "tpu", "mps"])
-    p.add_argument("--pretrained", default=None, help="Path to a .tl checkpoint to fine-tune from")
     p.add_argument("--quiet", action="store_true", help="Suppress training logs")
+
+    # Every other `TrainConfig` field gets a matching CLI flag, generated
+    # from the dataclass itself. This is what gives the CLI *parity* with
+    # `TrainConfig` -- previously only ~12 of its ~30 fields were exposed
+    # here, so anything not on that hand-picked list (optimizer,
+    # weight_decay, val_split, patience, precision, checkpoint_every,
+    # seed, resume, ...) was simply unreachable from the command line.
+    # Generating the flags instead of listing them by hand means a new
+    # `TrainConfig` field automatically gets a CLI flag too, so the two
+    # can't drift out of sync again.
+    hints = typing.get_type_hints(TrainConfig)
+    for f in dataclasses.fields(TrainConfig):
+        if f.name in _HANDPICKED_FIELDS:
+            continue
+        flag = "--" + f.name.replace("_", "-")
+        field_type = hints[f.name]
+        origin = typing.get_origin(field_type)
+        if origin is typing.Union:
+            # Optional[X] == Union[X, None] -- unwrap to X.
+            args = [a for a in typing.get_args(field_type) if a is not type(None)]
+            field_type = args[0] if args else str
+
+        if field_type is bool:
+            # BooleanOptionalAction gives both --flag/--no-flag and
+            # defaults to None, so we can tell "not passed" (use the
+            # auto-config default) apart from an explicit False.
+            p.add_argument(flag, dest=f.name, default=None, action=argparse.BooleanOptionalAction,
+                            help=f"Override TrainConfig.{f.name}")
+        elif field_type in (int, float, str):
+            p.add_argument(flag, dest=f.name, type=field_type, default=None,
+                            help=f"Override TrainConfig.{f.name}")
+        # Any other type (e.g. `extra`'s Dict) is skipped -- not
+        # meaningfully expressible as a single CLI flag.
 
 
 def _add_run_parser(subparsers) -> None:
@@ -75,26 +107,18 @@ def main(argv=None) -> int:
                 overrides["out"] = args.out
             if args.force:
                 overrides["force"] = True
-            if args.d_model:
-                overrides["d_model"] = args.d_model
-            if args.layers:
-                overrides["layers"] = args.layers
-            if args.heads:
-                overrides["heads"] = args.heads
-            if args.batch_size:
-                overrides["batch_size"] = args.batch_size
-            if args.gradient_accumulation_steps:
-                overrides["gradient_accumulation_steps"] = args.gradient_accumulation_steps
-            if args.epochs:
-                overrides["epochs"] = args.epochs
-            if args.learning_rate:
-                overrides["learning_rate"] = args.learning_rate
-            if args.device:
-                overrides["device"] = args.device
-            if args.pretrained:
-                overrides["pretrained"] = args.pretrained
             if args.quiet:
                 overrides["verbose"] = False
+            # Every generically-generated flag (see _add_train_parser)
+            # shares its dest name with the TrainConfig field it maps
+            # to, and defaults to None when not passed -- so we can just
+            # sweep them all up here instead of listing each by hand.
+            for f in dataclasses.fields(TrainConfig):
+                if f.name in _HANDPICKED_FIELDS:
+                    continue
+                value = getattr(args, f.name, None)
+                if value is not None:
+                    overrides[f.name] = value
             api.train(args.path, **overrides)
             return 0
 

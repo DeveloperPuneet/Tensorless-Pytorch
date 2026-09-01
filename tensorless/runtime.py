@@ -11,16 +11,20 @@ expose a task-appropriate prediction API:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any, Dict, List, Union
 
 import torch
+import torch.nn.functional as F
 
-from .models.registry import build_model
-from .tokenization import tokenizer_from_state_dict
+from .auto.detector import target_column
+from .data.loader import load_dataset
 from .data.tabular import TabularPreprocessor
 from .devices.device import get_torch_device
-from .errors import ModelError
+from .errors import DataError, ModelError
+from .metrics import ClassificationAccumulator, RegressionAccumulator, perplexity_from_loss
+from .models.registry import build_model
 from .serialization.tl_format import load_tl
+from .tokenization import tokenizer_from_state_dict
 from .web.browser import browse_for_context, web_search
 
 _INTERNET_ON_VALUES = {"connect", "on", "true", "1", "yes"}
@@ -238,6 +242,140 @@ class LoadedModel:
             raise ModelError(f"predict() not supported for task '{self.task}'.")
 
         return preds[0] if single else preds
+
+    # ------------------------------------------------------------------
+    # Post-hoc evaluation on new data
+    # ------------------------------------------------------------------
+    def evaluate(self, path: str, batch_size: int = 32) -> Dict[str, Any]:
+        """Evaluate this model against new data at `path` -- e.g. a held-out
+        test set that was never used for training or validation. Uses the
+        model's already-fitted tokenizer/preprocessor as-is (nothing is
+        re-fit on this data), and returns a metrics dict with `loss` plus
+        the task-appropriate metric(s): `perplexity` for text-generation,
+        `accuracy` for (text-)classification, `mae`/`rmse`/`r2` for
+        regression -- computed the same way as the live validation metrics
+        reported during training (see `tensorless.metrics`).
+
+        This is independent of the train/validation split used *during*
+        `tl.train()`: it accepts any dataset in the same format `tl.train()`
+        does and can be called any time after loading a model, e.g. weeks
+        later on data that didn't exist yet at training time.
+        """
+        ds = load_dataset(path)
+
+        if self.task == "text-generation":
+            if ds.kind != "text" or not ds.texts:
+                raise ModelError(
+                    "evaluate() for a text-generation model expects a plain "
+                    "text dataset (the same format tl.train() accepts)."
+                )
+            block = self.config["max_seq_len"]
+            all_ids: List[int] = []
+            for t in ds.texts:
+                all_ids.extend(self.tokenizer.encode(t, add_special_tokens=True))
+            if len(all_ids) < 2:
+                raise DataError("Not enough tokens in the evaluation data to compute a loss.")
+            losses = []
+            with torch.no_grad():
+                for start in range(0, len(all_ids) - 1, block):
+                    chunk = all_ids[start:start + block + 1]
+                    if len(chunk) < 2:
+                        continue
+                    x = torch.tensor([chunk[:-1]], dtype=torch.long, device=self.device)
+                    y = torch.tensor([chunk[1:]], dtype=torch.long, device=self.device)
+                    logits = self.model(x)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)), y.reshape(-1),
+                        ignore_index=self.tokenizer.pad_id,
+                    )
+                    losses.append(loss.item())
+            mean_loss = sum(losses) / max(1, len(losses))
+            return {"loss": mean_loss, "perplexity": perplexity_from_loss(mean_loss), "n_chunks": len(losses)}
+
+        elif self.task == "text-classification":
+            if ds.kind != "text_labeled":
+                raise ModelError(
+                    "evaluate() for a text-classification model expects a directory "
+                    "of class subfolders (the same format tl.train() accepts)."
+                )
+            classes = self.meta["classes"]
+            block_size = self.config["max_seq_len"]
+            losses, acc = [], ClassificationAccumulator()
+            with torch.no_grad():
+                for start in range(0, len(ds.texts), batch_size):
+                    texts = ds.texts[start:start + batch_size]
+                    labels_batch = ds.labels[start:start + batch_size]
+                    batch_ids, batch_mask = [], []
+                    for t in texts:
+                        ids = self.tokenizer.encode(t, add_special_tokens=True)[:block_size]
+                        mask = [1] * len(ids)
+                        if len(ids) < block_size:
+                            pad_len = block_size - len(ids)
+                            ids = ids + [self.tokenizer.pad_id] * pad_len
+                            mask = mask + [0] * pad_len
+                        batch_ids.append(ids)
+                        batch_mask.append(mask)
+                    input_ids = torch.tensor(batch_ids, dtype=torch.long, device=self.device)
+                    attn_mask = torch.tensor(batch_mask, dtype=torch.long, device=self.device)
+                    # Labels this model never saw during training map to -1
+                    # (never counted "correct") rather than crashing --
+                    # evaluation data isn't guaranteed to only contain
+                    # already-known classes.
+                    target_idx = torch.tensor(
+                        [classes.index(label) if label in classes else -1 for label in labels_batch],
+                        dtype=torch.long,
+                    )
+                    target_dev = target_idx.clamp(min=0).to(self.device)
+                    logits = self.model(input_ids, attention_mask=attn_mask)
+                    loss = F.cross_entropy(logits, target_dev)
+                    losses.append(loss.item())
+                    pred = logits.argmax(dim=-1).cpu()
+                    correct = ((pred == target_idx) & (target_idx != -1)).sum().item()
+                    acc.update(correct, len(labels_batch))
+            mean_loss = sum(losses) / max(1, len(losses))
+            return {"loss": mean_loss, **acc.compute(), "n_examples": acc.total}
+
+        elif self.task in ("classification", "regression"):
+            target_col = target_column(ds)
+            if target_col is None:
+                raise DataError(
+                    f"Could not find a target column in the evaluation data at '{path}'."
+                )
+            transformed = self.preprocessor.transform(ds.records, with_target=True)
+            n = transformed["numeric"].shape[0]
+            losses = []
+            cls_acc, reg_acc = ClassificationAccumulator(), RegressionAccumulator()
+            with torch.no_grad():
+                for start in range(0, n, batch_size):
+                    sl = slice(start, start + batch_size)
+                    numeric = transformed["numeric"][sl].to(self.device)
+                    categorical = transformed["categorical"][sl].to(self.device)
+                    target = transformed["target"][sl].to(self.device)
+                    out = self.model(numeric, categorical)
+                    if self.task == "classification":
+                        loss = F.cross_entropy(out, target)
+                        correct = (out.argmax(dim=-1) == target).sum().item()
+                        cls_acc.update(correct, target.numel())
+                    else:
+                        loss = F.mse_loss(out, target)
+                        # Metrics are computed in the *original* target scale
+                        # (not the standardized training scale), since MAE
+                        # or R2 in z-score units isn't meaningful to a user.
+                        pred_orig = out.double() * self.preprocessor.target_std + self.preprocessor.target_mean
+                        target_orig = target.double() * self.preprocessor.target_std + self.preprocessor.target_mean
+                        err = pred_orig - target_orig
+                        reg_acc.update(
+                            (err * err).sum().item(), err.abs().sum().item(),
+                            target_orig.sum().item(), (target_orig * target_orig).sum().item(),
+                            target.numel(),
+                        )
+                    losses.append(loss.item())
+            mean_loss = sum(losses) / max(1, len(losses))
+            extra = cls_acc.compute() if self.task == "classification" else reg_acc.compute()
+            return {"loss": mean_loss, **extra, "n_examples": n}
+
+        else:
+            raise ModelError(f"evaluate() not supported for task '{self.task}'.")
 
     def info(self) -> Dict[str, Any]:
         return {

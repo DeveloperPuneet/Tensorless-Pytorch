@@ -51,11 +51,29 @@ class CheckpointManager:
                 os.remove(tmp_path)
             raise CheckpointError(f"Failed to save checkpoint to '{self.path}': {e}") from e
 
-    def load(self, map_location: Optional[str] = None) -> Dict[str, Any]:
+    def load(self, map_location: Optional[str] = "cpu") -> Dict[str, Any]:
+        """Load the checkpoint.
+
+        Defaults to `map_location="cpu"` (rather than the original
+        device the tensors were saved from) so a checkpoint written on a
+        CUDA machine can still be loaded and resumed on a CPU-only
+        machine, or one with a different number/kind of GPUs -- resuming
+        training then moves things back to the actually-resolved device.
+        Without this, `torch.load` tries to deserialize storages onto
+        their *original* device and raises if that device isn't
+        available on the current machine.
+
+        `weights_only=True` restricts unpickling to a safe, well-known
+        set of types (tensors, dicts, lists, primitives, etc.), so
+        loading a checkpoint can't be used to execute arbitrary code via
+        a crafted pickle -- relevant since checkpoints can live on
+        shared/networked storage in multi-machine or resumed-elsewhere
+        setups.
+        """
         if not self.exists():
             raise CheckpointError(f"No checkpoint found at '{self.path}'.")
         try:
-            return torch.load(self.path, map_location=map_location, weights_only=False)
+            return torch.load(self.path, map_location=map_location, weights_only=True)
         except Exception as e:
             raise CheckpointError(
                 f"Checkpoint at '{self.path}' is corrupt or incompatible: {e}"

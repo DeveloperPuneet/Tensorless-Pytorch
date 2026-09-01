@@ -1,7 +1,7 @@
 import tensorless as tl
-from tensorless.data.loader import load_dataset
 from tensorless.auto.config import resolve_config
 from tensorless.config import TrainConfig
+from tensorless.data.loader import load_dataset
 from tensorless.training.data_prep import prepare_text_classification
 
 
@@ -32,7 +32,7 @@ def test_text_classification_accuracy_on_train_set(text_classification_dir, work
         max_seq_len=64,
     )
     ds = load_dataset(text_classification_dir)
-    correct = sum(1 for t, l in zip(ds.texts, ds.labels) if model.predict(t) == l)
+    correct = sum(1 for t, label in zip(ds.texts, ds.labels) if model.predict(t) == label)
     accuracy = correct / len(ds.texts)
     assert accuracy > 0.9
 

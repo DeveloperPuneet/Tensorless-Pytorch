@@ -20,13 +20,12 @@ Model-size tiers (approximate parameter counts, transformer LM):
 
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Tuple
 
-from ..config import TrainConfig, ResolvedConfig
+from ..config import ResolvedConfig, TrainConfig
 from ..data.loader import Dataset
-from ..devices.device import auto_select_device, get_torch_device, get_device_info, recommend_max_params
+from ..devices.device import auto_select_device, get_device_info, get_torch_device, recommend_max_params
 from .detector import detect_task
-
 
 # ---------------------------------------------------------------------------
 # Architecture sizing

@@ -8,27 +8,29 @@ needed to write the final `.tl` file.
 
 from __future__ import annotations
 
-import time
 import math
 import os
+import random
+import time
 from contextlib import nullcontext
 from typing import Any, Dict, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 
-from ..data.loader import Dataset
-from ..devices.device import get_torch_device, get_device_info, mark_step
 from ..checkpoint.manager import CheckpointManager
+from ..data.loader import Dataset
+from ..data.tabular import TabularPreprocessor
+from ..devices.device import get_device_info, get_torch_device, mark_step
+from ..errors import ModelError
+from ..metrics import ClassificationAccumulator, RegressionAccumulator, perplexity_from_loss
 from ..models.registry import build_model
 from ..tokenization import tokenizer_from_state_dict
-from ..data.tabular import TabularPreprocessor
-from ..errors import ModelError
-from .early_stopping import EarlyStopping
 from . import data_prep as dp
+from .early_stopping import EarlyStopping
 
 
 def _build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optimizer:
@@ -43,6 +45,26 @@ def _build_optimizer(model: nn.Module, cfg: Dict[str, Any]) -> torch.optim.Optim
         return torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
     else:
         raise ValueError(f"Unknown optimizer '{name}'")
+
+
+def _move_optimizer_state(optimizer: torch.optim.Optimizer, device: torch.device) -> None:
+    """Move an already-loaded optimizer's per-parameter state tensors
+    (e.g. Adam's exp_avg/exp_avg_sq) onto `device`.
+
+    Checkpoints are loaded with `map_location="cpu"` (see
+    `CheckpointManager.load`) so resuming works regardless of what
+    device the checkpoint was originally saved from -- but that means
+    `optimizer.load_state_dict(...)` leaves the optimizer's internal
+    state tensors on CPU even though the model parameters they belong to
+    now live on `device`. Without this, the very first optimizer step
+    after resuming raises a device-mismatch error (or silently does the
+    wrong thing) as soon as it tries to combine a CPU state tensor with
+    a CUDA gradient.
+    """
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device)
 
 
 def _lr_lambda(step: int, warmup_steps: int, total_steps: int) -> float:
@@ -85,6 +107,60 @@ def _compute_loss(task: str, model_type: str, model: nn.Module, batch, device, p
         target = target.to(device, non_blocking=non_blocking)
         pred = model(numeric, categorical)
         return F.mse_loss(pred, target)
+    else:
+        raise ValueError(f"Unsupported task/model_type combination: {task}/{model_type}")
+
+
+def _eval_forward(task: str, model_type: str, model: nn.Module, batch, device, pad_id: int):
+    """Like `_compute_loss`, but for the validation loop: also returns raw
+    per-batch prediction stats so a task-appropriate metric (accuracy,
+    perplexity, MAE/RMSE/R2) can be accumulated across the whole validation
+    set in the same forward pass, rather than needing a second pass over
+    the data just to compute it.
+    """
+    non_blocking = device.type == "cuda"
+    if model_type == "transformer" and task == "text-generation":
+        x, y = batch
+        x, y = x.to(device, non_blocking=non_blocking), y.to(device, non_blocking=non_blocking)
+        logits = model(x)
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), y.reshape(-1), ignore_index=pad_id
+        )
+        return loss, None
+    elif model_type == "transformer" and task == "text-classification":
+        input_ids, attn_mask, labels = batch
+        input_ids = input_ids.to(device, non_blocking=non_blocking)
+        attn_mask = attn_mask.to(device, non_blocking=non_blocking)
+        labels = labels.to(device, non_blocking=non_blocking)
+        logits = model(input_ids, attention_mask=attn_mask)
+        loss = F.cross_entropy(logits, labels)
+        correct = (logits.argmax(dim=-1) == labels).sum().item()
+        return loss, {"correct": correct, "total": labels.numel()}
+    elif model_type == "mlp" and task == "classification":
+        numeric, categorical, target = batch
+        numeric = numeric.to(device, non_blocking=non_blocking)
+        categorical = categorical.to(device, non_blocking=non_blocking)
+        target = target.to(device, non_blocking=non_blocking)
+        logits = model(numeric, categorical)
+        loss = F.cross_entropy(logits, target)
+        correct = (logits.argmax(dim=-1) == target).sum().item()
+        return loss, {"correct": correct, "total": target.numel()}
+    elif model_type == "mlp" and task == "regression":
+        numeric, categorical, target = batch
+        numeric = numeric.to(device, non_blocking=non_blocking)
+        categorical = categorical.to(device, non_blocking=non_blocking)
+        target = target.to(device, non_blocking=non_blocking)
+        pred = model(numeric, categorical)
+        loss = F.mse_loss(pred, target)
+        err = (pred - target).double()
+        t = target.double()
+        return loss, {
+            "sq_err_sum": (err * err).sum().item(),
+            "abs_err_sum": err.abs().sum().item(),
+            "target_sum": t.sum().item(),
+            "target_sq_sum": (t * t).sum().item(),
+            "n": target.numel(),
+        }
     else:
         raise ValueError(f"Unsupported task/model_type combination: {task}/{model_type}")
 
@@ -297,6 +373,7 @@ def run_training(
     if resume_state is not None:
         (ckpt_model.module if uses_module_wrapper else ckpt_model).load_state_dict(resume_state["model_state_dict"])
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        _move_optimizer_state(optimizer, device)
         scheduler.load_state_dict(resume_state["scheduler_state_dict"])
         if resume_state.get("scaler_state_dict"):
             scaler.load_state_dict(resume_state["scaler_state_dict"])
@@ -308,6 +385,31 @@ def run_training(
         best_metric_name = resume_state.get("best_metric_name")
         best_epoch = resume_state.get("best_epoch")
         best_state_dict = resume_state.get("best_model_state_dict")
+        # Restore RNG state so training continues the *same* random
+        # sequence (dropout masks, shuffling, sampling, ...) it would
+        # have followed had it never stopped, rather than replaying from
+        # the top of the seeded sequence again from `torch.manual_seed`
+        # above. Wrapped defensively: a checkpoint resumed on a machine
+        # with a different number of GPUs, or an older checkpoint saved
+        # before this field existed, shouldn't prevent resuming.
+        rng_state = resume_state.get("rng_state")
+        if rng_state is not None:
+            try:
+                torch.set_rng_state(rng_state.cpu())
+            except Exception:
+                pass
+        cuda_rng_state = resume_state.get("cuda_rng_state")
+        if cuda_rng_state is not None and torch.cuda.is_available():
+            try:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+            except Exception:
+                pass
+        python_rng_state = resume_state.get("python_rng_state")
+        if python_rng_state is not None:
+            try:
+                random.setstate(python_rng_state)
+            except Exception:
+                pass
         if cfg["verbose"]:
             log_fn(f"[tensorless] resuming from checkpoint: epoch={start_epoch}, step={global_step}")
 
@@ -335,6 +437,12 @@ def run_training(
             "preprocessor_state": prepared.preprocessor.state_dict() if prepared.preprocessor else None,
             "dataset_fingerprint": dataset_fingerprint,
             "training_complete": training_complete,
+            # RNG state, so a resumed run continues the same random
+            # sequence rather than replaying from the seed again -- see
+            # the restore logic above `if resume_state is not None`.
+            "rng_state": torch.get_rng_state(),
+            "cuda_rng_state": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "python_rng_state": random.getstate(),
         }
         checkpoint_mgr.save(state)
 
@@ -344,6 +452,7 @@ def run_training(
     stop = False
     t0 = time.time()
     last_val_loss = None
+    last_val_metrics: Dict[str, Any] = {}
     last_train_loss = None
 
     for epoch in range(start_epoch, cfg["epochs"]):
@@ -407,10 +516,21 @@ def run_training(
         if prepared.val_loader is not None:
             model.eval()
             losses = []
+            cls_acc = ClassificationAccumulator()
+            reg_acc = RegressionAccumulator()
             with torch.no_grad():
                 for batch in prepared.val_loader:
                     with _amp_context(device, cfg["precision"]):
-                        losses.append(_compute_loss(task, model_type, model, batch, device, pad_id).item())
+                        loss, stats = _eval_forward(task, model_type, model, batch, device, pad_id)
+                        losses.append(loss.item())
+                        if stats is not None:
+                            if "correct" in stats:
+                                cls_acc.update(stats["correct"], stats["total"])
+                            else:
+                                reg_acc.update(
+                                    stats["sq_err_sum"], stats["abs_err_sum"],
+                                    stats["target_sum"], stats["target_sq_sum"], stats["n"],
+                                )
                     mark_step(device)
             val_loss = sum(losses) / max(1, len(losses))
             if distributed:
@@ -418,12 +538,24 @@ def run_training(
                 dist.all_reduce(val_tensor, op=dist.ReduceOp.SUM)
                 val_loss = (val_tensor / world_size).item()
             last_val_loss = val_loss
+            if task == "text-generation":
+                last_val_metrics = {"perplexity": perplexity_from_loss(val_loss)}
+            elif task in ("text-classification", "classification"):
+                last_val_metrics = cls_acc.compute()
+            elif task == "regression":
+                last_val_metrics = reg_acc.compute()
+            else:
+                last_val_metrics = {}
             model.train()
             is_best = early_stopper.step(val_loss, state=None)
             if cfg["verbose"]:
+                metric_str = " ".join(
+                    f"{k}={v:.4f}" for k, v in last_val_metrics.items() if v is not None
+                )
                 log_fn(
                     f"[tensorless] epoch {epoch + 1}/{cfg['epochs']} "
                     f"train_loss={last_train_loss:.4f} val_loss={val_loss:.4f}"
+                    f"{' ' + metric_str if metric_str else ''}"
                     f"{' (best)' if is_best else ''}"
                 )
             _maybe_update_best(val_loss, "val_loss", epoch + 1)
@@ -446,6 +578,7 @@ def run_training(
     metrics = {
         "final_train_loss": last_train_loss,
         "final_val_loss": last_val_loss,
+        **{f"final_val_{k}": v for k, v in last_val_metrics.items()},
         "best_metric": best_metric if best_state_dict is not None else None,
         "best_metric_name": best_metric_name,
         "best_epoch": best_epoch,

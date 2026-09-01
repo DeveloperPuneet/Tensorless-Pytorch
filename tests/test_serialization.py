@@ -1,8 +1,8 @@
 import os
 
 import tensorless as tl
-from tensorless.serialization.tl_format import save_tl, load_tl
 from tensorless.errors import SerializationError
+from tensorless.serialization.tl_format import load_tl
 
 from .conftest import TINY_TEXT_KWARGS
 

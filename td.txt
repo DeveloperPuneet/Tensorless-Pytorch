@@ -1,9 +1,0 @@
-Configuration-aware model cache invalidation.
-Tabular train/validation preprocessing split.
-RNG and cross-device checkpoint restoration.
-Strict dataset validation and supported-file fingerprinting.
-Centralized config validation.
-CLI parity with TrainConfig.
-Metrics and evaluation APIs.
-Security hardening for .tl loading and web browsing.
-CI, linting, coverage, and packaging tests.

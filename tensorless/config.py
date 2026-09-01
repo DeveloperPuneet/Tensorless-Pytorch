@@ -8,8 +8,16 @@ filling in every `None` with a concrete value.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Any, Dict
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, Optional
+
+_VALID_TASKS = {"text-generation", "text-classification", "classification", "regression"}
+_VALID_MODEL_TYPES = {"transformer", "mlp"}
+_VALID_ARCHITECTURES = {"v1", "v2"}
+_VALID_TOKENIZERS = {"char", "bpe"}
+_VALID_OPTIMIZERS = {"adamw", "adam", "sgd"}
+_VALID_PRECISIONS = {"fp32", "fp16", "bf16"}
+_VALID_DEVICES = {"cpu", "cuda", "mps", "tpu"}
 
 
 @dataclass
@@ -82,6 +90,94 @@ class TrainConfig:
         d = asdict(self)
         d.pop("extra", None)
         return {k: v for k, v in d.items() if v is not None and v is not False}
+
+    def validate(self) -> None:
+        """Validate every explicitly-set field, centrally and up front.
+
+        Previously, bad values (an unknown optimizer, a negative
+        `epochs`, an out-of-range `dropout`, ...) were only caught deep
+        inside the training pipeline -- sometimes as an inconsistent mix
+        of `ValueError`/`AssertionError`/`ZeroDivisionError`, sometimes
+        only after the dataset had already been loaded and preprocessed.
+        Validating here (called immediately in `_build_train_config`,
+        before any file I/O) fails fast with one consistent error type
+        (`ConfigError`) and a message that names the offending field.
+
+        Fields left as `None` are untouched -- they'll be filled in by
+        the auto-config system, whose own choices are always valid by
+        construction.
+        """
+        from .errors import ConfigError
+
+        def fail(field_name: str, msg: str) -> None:
+            raise ConfigError(f"Invalid {field_name}: {msg}")
+
+        def check_choice(field_name: str, value: Any, choices: set) -> None:
+            if value is not None and value not in choices:
+                fail(field_name, f"must be one of {sorted(choices)}, got {value!r}")
+
+        def check_positive_int(field_name: str, value: Any, allow_zero: bool = False) -> None:
+            if value is None:
+                return
+            if not isinstance(value, int) or isinstance(value, bool):
+                fail(field_name, f"must be an int, got {value!r}")
+            elif value < 0 or (value == 0 and not allow_zero):
+                bound = ">= 0" if allow_zero else "> 0"
+                fail(field_name, f"must be {bound}, got {value!r}")
+
+        def check_positive_float(field_name: str, value: Any, allow_zero: bool = False) -> None:
+            if value is None:
+                return
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                fail(field_name, f"must be a number, got {value!r}")
+            elif value < 0 or (value == 0 and not allow_zero):
+                bound = ">= 0" if allow_zero else "> 0"
+                fail(field_name, f"must be {bound}, got {value!r}")
+
+        def check_fraction(field_name: str, value: Any, low: float = 0.0, high: float = 1.0) -> None:
+            if value is None:
+                return
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                fail(field_name, f"must be a number, got {value!r}")
+            elif not (low <= value < high):
+                fail(field_name, f"must be in [{low}, {high}), got {value!r}")
+
+        check_choice("task", self.task, _VALID_TASKS)
+        check_choice("model_type", self.model_type, _VALID_MODEL_TYPES)
+        check_choice("architecture", self.architecture, _VALID_ARCHITECTURES)
+        check_choice("tokenizer", self.tokenizer, _VALID_TOKENIZERS)
+        check_choice("optimizer", self.optimizer, _VALID_OPTIMIZERS)
+        check_choice("precision", self.precision, _VALID_PRECISIONS)
+        check_choice("device", self.device, _VALID_DEVICES)
+
+        check_positive_int("d_model", self.d_model)
+        check_positive_int("layers", self.layers)
+        check_positive_int("heads", self.heads)
+        check_positive_int("ff_mult", self.ff_mult)
+        check_positive_int("max_seq_len", self.max_seq_len)
+        check_positive_int("bpe_vocab_size", self.bpe_vocab_size)
+        check_positive_int("num_workers", self.num_workers, allow_zero=True)
+        check_positive_int("batch_size", self.batch_size)
+        check_positive_int("epochs", self.epochs)
+        check_positive_int("max_steps", self.max_steps)
+        check_positive_int("gradient_accumulation_steps", self.gradient_accumulation_steps)
+        check_positive_int("warmup_steps", self.warmup_steps, allow_zero=True)
+        check_positive_int("patience", self.patience)
+        check_positive_int("checkpoint_every", self.checkpoint_every)
+
+        check_positive_float("learning_rate", self.learning_rate)
+        check_positive_float("weight_decay", self.weight_decay, allow_zero=True)
+        check_positive_float("grad_clip", self.grad_clip, allow_zero=True)
+        check_positive_float("min_delta", self.min_delta, allow_zero=True)
+
+        check_fraction("dropout", self.dropout, low=0.0, high=1.0)
+        check_fraction("val_split", self.val_split, low=0.0, high=1.0)
+
+        if self.d_model is not None and self.heads is not None and self.d_model % self.heads != 0:
+            fail("heads", f"d_model ({self.d_model}) must be divisible by heads ({self.heads})")
+
+        if self.pretrained is not None and not isinstance(self.pretrained, str):
+            fail("pretrained", f"must be a path string, got {self.pretrained!r}")
 
 
 @dataclass

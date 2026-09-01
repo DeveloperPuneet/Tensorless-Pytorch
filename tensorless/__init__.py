@@ -12,17 +12,17 @@ ML with maximum automation and minimum setup.
 See https://github.com/DeveloperPuneet/Tensorless-Pytorch for full documentation.
 """
 
-from .api import train, pretrain, run, load, inspect
+from ._version import __version__
+from .api import inspect, load, pretrain, run, train
 from .config import TrainConfig
 from .errors import (
-    TensorlessError,
-    DataError,
-    ConfigError,
-    ModelError,
     CheckpointError,
+    ConfigError,
+    DataError,
+    ModelError,
     SerializationError,
+    TensorlessError,
 )
-from ._version import __version__
 
 __all__ = [
     "train",

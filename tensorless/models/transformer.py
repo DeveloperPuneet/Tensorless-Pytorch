@@ -13,15 +13,14 @@ working, from-scratch model that trains fast enough on CPU for the
 
 from __future__ import annotations
 
-import math
 from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.checkpoint
 
 from ..errors import ModelError
-import torch.nn.functional as F
 
 
 class CausalSelfAttention(nn.Module):

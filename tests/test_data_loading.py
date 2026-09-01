@@ -1,5 +1,4 @@
 import json
-import os
 
 import pytest
 
@@ -74,3 +73,28 @@ def test_non_utf8_file_raises(workdir):
         f.write(b"\xff\xfe\x00bad")
     with pytest.raises(DataError):
         load_dataset(str(path))
+
+
+def test_empty_class_subfolder_raises(workdir):
+    """A class subfolder with no readable text files inside it must
+    raise rather than silently vanishing as a class -- otherwise the
+    resulting dataset would have fewer labels than the directory
+    structure implies, with no indication anything was dropped."""
+    root = workdir / "textcls"
+    (root / "positive").mkdir(parents=True)
+    (root / "negative").mkdir(parents=True)
+    (root / "positive" / "p1.txt").write_text("great movie")
+    # "negative" is left empty.
+    with pytest.raises(DataError, match="negative"):
+        load_dataset(str(root))
+
+
+def test_class_subfolder_with_only_unsupported_files_raises(workdir):
+    root = workdir / "textcls"
+    (root / "positive").mkdir(parents=True)
+    (root / "negative").mkdir(parents=True)
+    (root / "positive" / "p1.txt").write_text("great movie")
+    # "negative" has a file, but not a supported (.txt) one.
+    (root / "negative" / "n1.pdf").write_bytes(b"not text")
+    with pytest.raises(DataError, match="negative"):
+        load_dataset(str(root))
